@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project specific
+data/
+output/
+*.zip
+*.dcm
+*.nii
+*.nii.gz
+*.pth
+*.ply
+.ipynb_checkpoints/
