@@ -7,6 +7,8 @@ import json
 import shutil
 import sys
 
+import numpy as np
+
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
@@ -25,6 +27,17 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--patient-id", required=True)
     inventory.add_argument("--study-uid", required=True)
     inventory.add_argument("--csv", type=Path)
+
+    inspect_rois = commands.add_parser(
+        "inspect-rois",
+        help="Describe contour geometry for every ROI in one phase.",
+    )
+    inspect_rois.add_argument("--dicom-dir", type=Path, required=True)
+    inspect_rois.add_argument("--patient-id", required=True)
+    inspect_rois.add_argument("--study-uid", required=True)
+    inspect_rois.add_argument("--phase", type=float, default=0.0)
+    inspect_rois.add_argument("--rtstruct-file", type=Path)
+    inspect_rois.add_argument("--csv", type=Path)
 
     build = commands.add_parser(
         "build", help="Rasterize one ROI, build one mesh, and validate round-trip geometry."
@@ -55,6 +68,24 @@ def run_inventory(args: argparse.Namespace) -> int:
         args.csv.parent.mkdir(parents=True, exist_ok=True)
         frame.to_csv(args.csv, index=False)
         print(f"Inventory CSV: {args.csv}")
+    return 0
+
+
+def run_inspect_rois(args: argparse.Namespace) -> int:
+    from medgs4d.rtstruct import inspect_phase_rois
+
+    frame = inspect_phase_rois(
+        args.dicom_dir,
+        args.patient_id,
+        args.study_uid,
+        args.phase,
+        rtstruct_file=args.rtstruct_file,
+    )
+    print(frame.to_string(index=False))
+    if args.csv:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        frame.to_csv(args.csv, index=False)
+        print(f"ROI inspection CSV: {args.csv}")
     return 0
 
 
@@ -192,6 +223,8 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.command == "inventory":
         return run_inventory(args)
+    if args.command == "inspect-rois":
+        return run_inspect_rois(args)
     return run_build(args)
 
 

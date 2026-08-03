@@ -264,6 +264,194 @@ def rtstruct_roi_names(rtstruct_path: Path) -> list[str]:
     ]
 
 
+ROI_INSPECTION_COLUMNS = [
+    "PatientID",
+    "StudyInstanceUID",
+    "PhasePercent",
+    "StructureSetLabel",
+    "ROIName",
+    "ROINumber",
+    "ContourCount",
+    "GeometricTypes",
+    "PointCount",
+    "DistinctContourSlices",
+    "ContoursPerSliceMax",
+    "ZMinMm",
+    "ZMaxMm",
+    "ZExtentMm",
+    "ClosedPlanar",
+    "VolumeCandidate",
+    "RTSTRUCTFile",
+]
+
+
+def summarize_rtstruct_rois(
+    dataset: Any,
+    rtstruct_path: Path | str = "",
+    phase_percent: float | None = None,
+) -> pd.DataFrame:
+    """Summarize contour geometry for every ROI in one RTSTRUCT dataset."""
+
+    if phase_percent is None:
+        phase_percent = parse_phase_percent(
+            str(getattr(dataset, "SeriesDescription", ""))
+        )
+
+    contours_by_roi: dict[int, list[Any]] = {}
+    for roi_contour in getattr(dataset, "ROIContourSequence", ()) or ():
+        roi_number = int(getattr(roi_contour, "ReferencedROINumber", -1))
+        contours_by_roi.setdefault(roi_number, []).extend(
+            list(getattr(roi_contour, "ContourSequence", ()) or ())
+        )
+
+    rows = []
+    for roi in getattr(dataset, "StructureSetROISequence", ()) or ():
+        roi_number = int(roi.ROINumber)
+        contours = contours_by_roi.get(roi_number, [])
+        geometric_types = sorted(
+            {
+                str(getattr(contour, "ContourGeometricType", ""))
+                for contour in contours
+            }
+        )
+
+        point_count = 0
+        contour_z_values = []
+        valid_polygon_points = True
+        for contour in contours:
+            values = np.asarray(
+                getattr(contour, "ContourData", ()) or (),
+                dtype=np.float64,
+            )
+            points = values.reshape(-1, 3)
+            point_count += len(points)
+            valid_polygon_points &= len(points) >= 3
+            if len(points):
+                contour_z_values.append(float(points[:, 2].mean()))
+
+        rounded_z = [round(value, 3) for value in contour_z_values]
+        distinct_z = sorted(set(rounded_z))
+        counts_by_z = {
+            value: rounded_z.count(value)
+            for value in distinct_z
+        }
+        closed_planar = bool(contours) and geometric_types == ["CLOSED_PLANAR"]
+        volume_candidate = (
+            closed_planar
+            and valid_polygon_points
+            and len(distinct_z) >= 2
+        )
+
+        z_min = min(contour_z_values) if contour_z_values else math.nan
+        z_max = max(contour_z_values) if contour_z_values else math.nan
+        rows.append(
+            {
+                "PatientID": str(getattr(dataset, "PatientID", "")),
+                "StudyInstanceUID": str(
+                    getattr(dataset, "StudyInstanceUID", "")
+                ),
+                "PhasePercent": phase_percent,
+                "StructureSetLabel": str(
+                    getattr(dataset, "StructureSetLabel", "")
+                ),
+                "ROIName": str(getattr(roi, "ROIName", "")),
+                "ROINumber": roi_number,
+                "ContourCount": len(contours),
+                "GeometricTypes": " | ".join(geometric_types),
+                "PointCount": point_count,
+                "DistinctContourSlices": len(distinct_z),
+                "ContoursPerSliceMax": max(counts_by_z.values(), default=0),
+                "ZMinMm": z_min,
+                "ZMaxMm": z_max,
+                "ZExtentMm": z_max - z_min if contour_z_values else math.nan,
+                "ClosedPlanar": closed_planar,
+                "VolumeCandidate": volume_candidate,
+                "RTSTRUCTFile": str(rtstruct_path),
+            }
+        )
+
+    return pd.DataFrame(rows, columns=ROI_INSPECTION_COLUMNS)
+
+
+def inspect_rtstruct_rois(
+    rtstruct_path: Path,
+    phase_percent: float | None = None,
+) -> pd.DataFrame:
+    """Read one RTSTRUCT file and summarize all ROI contour geometries."""
+
+    import pydicom
+
+    dataset = pydicom.dcmread(
+        str(rtstruct_path),
+        stop_before_pixels=True,
+        force=True,
+    )
+    if str(getattr(dataset, "Modality", "")).upper() != "RTSTRUCT":
+        raise ValueError(f"Not an RTSTRUCT object: {rtstruct_path}")
+    return summarize_rtstruct_rois(dataset, rtstruct_path, phase_percent)
+
+
+def find_rtstruct_file(
+    dicom_dir: Path,
+    patient_id: str,
+    study_instance_uid: str,
+    phase: float,
+    roi_name: str | None = None,
+    rtstruct_file: Path | None = None,
+) -> Path:
+    """Resolve exactly one local RTSTRUCT object for one respiratory phase."""
+
+    if rtstruct_file is not None:
+        return Path(rtstruct_file)
+
+    inventory = scan_patient_series(dicom_dir, patient_id)
+    candidates = inventory.loc[
+        (inventory["StudyInstanceUID"].astype(str) == str(study_instance_uid))
+        & (inventory["Modality"].astype(str).str.upper() == "RTSTRUCT")
+        & np.isclose(
+            inventory["PhasePercent"].astype(float),
+            float(phase),
+            equal_nan=False,
+        )
+    ]
+
+    candidate_files = []
+    for row in candidates.itertuples():
+        for path in list_dicom_files(Path(row.SeriesPath)):
+            dataset = read_dicom_header(path)
+            if str(getattr(dataset, "Modality", "")).upper() != "RTSTRUCT":
+                continue
+            if roi_name is None or roi_name in rtstruct_roi_names(path):
+                candidate_files.append(path)
+
+    candidate_files = sorted(set(candidate_files))
+    if len(candidate_files) != 1:
+        raise ValueError(
+            f"Expected exactly one RTSTRUCT file for phase {phase:g}% and ROI "
+            f"{roi_name!r}; found {len(candidate_files)}: {candidate_files}"
+        )
+    return candidate_files[0]
+
+
+def inspect_phase_rois(
+    dicom_dir: Path,
+    patient_id: str,
+    study_instance_uid: str,
+    phase: float,
+    rtstruct_file: Path | None = None,
+) -> pd.DataFrame:
+    """Summarize all ROI geometries for one study phase."""
+
+    path = find_rtstruct_file(
+        dicom_dir,
+        patient_id,
+        study_instance_uid,
+        phase,
+        rtstruct_file=rtstruct_file,
+    )
+    return inspect_rtstruct_rois(path, phase_percent=phase)
+
+
 def _referenced_series_uids(dataset: Any) -> set[str]:
     referenced = set()
     for frame in getattr(dataset, "ReferencedFrameOfReferenceSequence", ()) or ():
@@ -298,27 +486,14 @@ def find_rtstruct_and_ct_series(
     """Resolve one RTSTRUCT object and its referenced local CT series."""
 
     inventory = scan_patient_series(dicom_dir, patient_id)
-    if rtstruct_file is None:
-        candidates = inventory.loc[
-            (inventory["StudyInstanceUID"].astype(str) == str(study_instance_uid))
-            & (inventory["Modality"].astype(str).str.upper() == "RTSTRUCT")
-            & np.isclose(inventory["PhasePercent"].astype(float), float(phase), equal_nan=False)
-        ]
-        candidate_files = []
-        for row in candidates.itertuples():
-            for path in list_dicom_files(Path(row.SeriesPath)):
-                dataset = read_dicom_header(path)
-                if str(getattr(dataset, "Modality", "")).upper() != "RTSTRUCT":
-                    continue
-                if roi_name is None or roi_name in rtstruct_roi_names(path):
-                    candidate_files.append(path)
-        candidate_files = sorted(set(candidate_files))
-        if len(candidate_files) != 1:
-            raise ValueError(
-                f"Expected exactly one RTSTRUCT file for phase {phase:g}% and ROI "
-                f"{roi_name!r}; found {len(candidate_files)}: {candidate_files}"
-            )
-        rtstruct_file = candidate_files[0]
+    rtstruct_file = find_rtstruct_file(
+        dicom_dir,
+        patient_id,
+        study_instance_uid,
+        phase,
+        roi_name=roi_name,
+        rtstruct_file=rtstruct_file,
+    )
 
     import pydicom
 
@@ -486,7 +661,21 @@ def inventory_rtstruct_objects(
                     "RTSTRUCTFile": str(path),
                 }
             )
-    return pd.DataFrame(rows).sort_values(
+    columns = [
+        "PatientID",
+        "StudyInstanceUID",
+        "PhasePercent",
+        "RTSeriesInstanceUID",
+        "SOPInstanceUID",
+        "StructureSetLabel",
+        "ROICount",
+        "ROINames",
+        "RTSTRUCTFile",
+    ]
+    frame = pd.DataFrame(rows, columns=columns)
+    if frame.empty:
+        return frame
+    return frame.sort_values(
         ["PhasePercent", "RTSeriesInstanceUID", "RTSTRUCTFile"]
     ).reset_index(drop=True)
 
