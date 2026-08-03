@@ -366,29 +366,60 @@ def scan_patient_series(dicom_dir: Path, patient_id: str) -> pd.DataFrame:
     return frame
 
 
+def list_patient_series(
+    dicom_dir: Path,
+    patient_id: str,
+    *,
+    study_instance_uid: str | None = None,
+    modality: str | None = None,
+) -> pd.DataFrame:
+    """List complete series metadata without selecting respiratory CT phases."""
+
+    series = scan_patient_series(dicom_dir, patient_id)
+    if study_instance_uid is not None:
+        series = series.loc[
+            series["StudyInstanceUID"].astype(str) == str(study_instance_uid)
+        ]
+    if modality is not None:
+        series = series.loc[
+            series["Modality"].astype(str).str.upper() == modality.upper()
+        ]
+    return series.sort_values(
+        ["StudyDate", "StudyInstanceUID", "Modality", "PhasePercent", "SeriesInstanceUID"],
+        na_position="last",
+    ).reset_index(drop=True)
+
+
 def list_patient_studies(dicom_dir: Path, patient_id: str) -> pd.DataFrame:
-    """Summarize all studies available for one extracted patient."""
+    """Summarize studies and expose modality-specific series counts."""
 
     series = scan_patient_series(dicom_dir, patient_id)
     rows = []
     for uid, group in series.groupby("StudyInstanceUID", sort=False):
-        ct = group.loc[group["Modality"] == "CT"]
+        modality = group["Modality"].astype(str).str.upper()
+        ct = group.loc[modality == "CT"]
+        rtstruct = group.loc[modality == "RTSTRUCT"]
         phases = sorted(ct["PhasePercent"].dropna().astype(float).unique())
+        modalities = sorted(value for value in modality.unique() if value)
         rows.append(
             {
                 "PatientID": patient_id,
                 "StudyInstanceUID": uid,
                 "StudyDate": group["StudyDate"].iloc[0],
                 "StudyDescription": group["StudyDescription"].iloc[0],
+                "Modalities": ", ".join(modalities),
                 "SeriesCount": len(group),
                 "CTSeriesCount": len(ct),
+                "RTSTRUCTSeriesCount": len(rtstruct),
+                "OtherSeriesCount": len(group) - len(ct) - len(rtstruct),
                 "PhaseCount": len(phases),
                 "Phases": ", ".join(f"{phase:g}" for phase in phases),
                 "MaxSlicesPerSeries": int(ct["DICOMFiles"].max()) if not ct.empty else 0,
             }
         )
     return pd.DataFrame(rows).sort_values(
-        ["PhaseCount", "MaxSlicesPerSeries"], ascending=False
+        ["PhaseCount", "MaxSlicesPerSeries", "RTSTRUCTSeriesCount"],
+        ascending=False,
     ).reset_index(drop=True)
 
 
@@ -417,6 +448,200 @@ def inspect_study(
         .reset_index(drop=True)
     )
     return selected
+
+
+
+def _rtstruct_referenced_series_uids(dataset: Any) -> set[str]:
+    """Collect CT SeriesInstanceUID values referenced by one RTSTRUCT object."""
+
+    referenced: set[str] = set()
+    for frame in getattr(dataset, "ReferencedFrameOfReferenceSequence", ()) or ():
+        for study in getattr(frame, "RTReferencedStudySequence", ()) or ():
+            for series in getattr(study, "RTReferencedSeriesSequence", ()) or ():
+                uid = str(getattr(series, "SeriesInstanceUID", ""))
+                if uid:
+                    referenced.add(uid)
+    return referenced
+
+
+def _rtstruct_roi_names(dataset: Any) -> list[str]:
+    """Return ordered unique ROI names declared by one RTSTRUCT object."""
+
+    names = []
+    seen = set()
+    for roi in getattr(dataset, "StructureSetROISequence", ()) or ():
+        name = str(getattr(roi, "ROIName", "")).strip()
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _rtstruct_contour_summary(dataset: Any) -> tuple[int, set[str]]:
+    """Count contour records and referenced contour-image SOP instances."""
+
+    contour_count = 0
+    image_uids: set[str] = set()
+    for roi_contour in getattr(dataset, "ROIContourSequence", ()) or ():
+        for contour in getattr(roi_contour, "ContourSequence", ()) or ():
+            contour_count += 1
+            for image in getattr(contour, "ContourImageSequence", ()) or ():
+                uid = str(getattr(image, "ReferencedSOPInstanceUID", ""))
+                if uid:
+                    image_uids.add(uid)
+    return contour_count, image_uids
+
+
+def _build_ct_sop_series_index(series: pd.DataFrame) -> dict[str, str]:
+    """Map local CT SOPInstanceUID values to their parent series."""
+
+    index: dict[str, str] = {}
+    ct = series.loc[series["Modality"].astype(str).str.upper() == "CT"]
+    for row in ct.itertuples():
+        series_uid = str(row.SeriesInstanceUID)
+        for path in list_dicom_files(Path(row.SeriesPath)):
+            dataset = read_dicom_header(path)
+            sop_uid = str(getattr(dataset, "SOPInstanceUID", ""))
+            if sop_uid:
+                index[sop_uid] = series_uid
+    return index
+
+
+def list_rtstructs(
+    dicom_dir: Path,
+    patient_id: str,
+    *,
+    referenced_study_uid: str | None = None,
+) -> pd.DataFrame:
+    """Inventory RTSTRUCT objects and resolve their referenced local CT series."""
+
+    series = scan_patient_series(dicom_dir, patient_id)
+    rt_series = series.loc[
+        series["Modality"].astype(str).str.upper() == "RTSTRUCT"
+    ]
+    if rt_series.empty:
+        return pd.DataFrame(
+            columns=[
+                "PatientID",
+                "RTStudyInstanceUID",
+                "RTSeriesInstanceUID",
+                "StudyDate",
+                "SeriesDescription",
+                "StructureSetLabel",
+                "ROICount",
+                "ROINames",
+                "ContourCount",
+                "ContourImageCount",
+                "ReferencedCTSeriesCount",
+                "ReferencedCTStudyUIDs",
+                "ReferencedCTSeriesUIDs",
+                "ReferencedPhases",
+                "ReferencedSeriesDescriptions",
+                "DICOMFile",
+                "SeriesPath",
+            ]
+        )
+
+    series_by_uid = {
+        str(row.SeriesInstanceUID): row
+        for row in series.itertuples()
+    }
+    sop_to_series: dict[str, str] | None = None
+    rows = []
+
+    for rt_row in rt_series.itertuples():
+        for path in list_dicom_files(Path(rt_row.SeriesPath)):
+            dataset = read_dicom_header(path)
+            if str(getattr(dataset, "Modality", "")).upper() != "RTSTRUCT":
+                continue
+
+            referenced_series = _rtstruct_referenced_series_uids(dataset)
+            contour_count, contour_image_uids = _rtstruct_contour_summary(dataset)
+
+            if not referenced_series and contour_image_uids:
+                if sop_to_series is None:
+                    sop_to_series = _build_ct_sop_series_index(series)
+                referenced_series.update(
+                    sop_to_series[uid]
+                    for uid in contour_image_uids
+                    if uid in sop_to_series
+                )
+
+            referenced_rows = [
+                series_by_uid[uid]
+                for uid in sorted(referenced_series)
+                if uid in series_by_uid
+            ]
+            referenced_studies = sorted(
+                {
+                    str(row.StudyInstanceUID)
+                    for row in referenced_rows
+                    if str(row.StudyInstanceUID)
+                }
+            )
+            referenced_phases = sorted(
+                {
+                    float(row.PhasePercent)
+                    for row in referenced_rows
+                    if pd.notna(row.PhasePercent)
+                }
+            )
+            referenced_descriptions = sorted(
+                {
+                    str(row.SeriesDescription)
+                    for row in referenced_rows
+                    if str(row.SeriesDescription)
+                }
+            )
+            roi_names = _rtstruct_roi_names(dataset)
+
+            row = {
+                "PatientID": str(getattr(dataset, "PatientID", patient_id)),
+                "RTStudyInstanceUID": str(
+                    getattr(dataset, "StudyInstanceUID", rt_row.StudyInstanceUID)
+                ),
+                "RTSeriesInstanceUID": str(
+                    getattr(dataset, "SeriesInstanceUID", rt_row.SeriesInstanceUID)
+                ),
+                "StudyDate": str(getattr(dataset, "StudyDate", rt_row.StudyDate)),
+                "SeriesDescription": str(
+                    getattr(dataset, "SeriesDescription", rt_row.SeriesDescription)
+                ),
+                "StructureSetLabel": str(
+                    getattr(dataset, "StructureSetLabel", "")
+                ),
+                "ROICount": len(roi_names),
+                "ROINames": " | ".join(roi_names),
+                "ContourCount": contour_count,
+                "ContourImageCount": len(contour_image_uids),
+                "ReferencedCTSeriesCount": len(referenced_series),
+                "ReferencedCTStudyUIDs": ", ".join(referenced_studies),
+                "ReferencedCTSeriesUIDs": ", ".join(sorted(referenced_series)),
+                "ReferencedPhases": ", ".join(
+                    f"{phase:g}" for phase in referenced_phases
+                ),
+                "ReferencedSeriesDescriptions": " | ".join(
+                    referenced_descriptions
+                ),
+                "DICOMFile": str(path),
+                "SeriesPath": str(rt_row.SeriesPath),
+            }
+            if (
+                referenced_study_uid is None
+                or str(referenced_study_uid) in referenced_studies
+            ):
+                rows.append(row)
+
+    return pd.DataFrame(rows).sort_values(
+        [
+            "ReferencedCTStudyUIDs",
+            "ReferencedPhases",
+            "RTStudyInstanceUID",
+            "RTSeriesInstanceUID",
+            "DICOMFile",
+        ],
+        na_position="last",
+    ).reset_index(drop=True)
 
 
 def collect_phase_series(

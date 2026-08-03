@@ -35,6 +35,23 @@ def build_parser() -> argparse.ArgumentParser:
     studies.add_argument("--dicom-dir", type=Path, required=True)
     studies.add_argument("--patient-id", required=True)
 
+    series = commands.add_parser(
+        "list-series",
+        help="List complete DICOM series metadata without CT phase selection.",
+    )
+    series.add_argument("--dicom-dir", type=Path, required=True)
+    series.add_argument("--patient-id", required=True)
+    series.add_argument("--study-uid")
+    series.add_argument("--modality")
+
+    rtstructs = commands.add_parser(
+        "list-rtstructs",
+        help="List RTSTRUCT objects, ROI names, and referenced CT series.",
+    )
+    rtstructs.add_argument("--dicom-dir", type=Path, required=True)
+    rtstructs.add_argument("--patient-id", required=True)
+    rtstructs.add_argument("--referenced-study-uid")
+
     inspect = commands.add_parser("inspect", help="Inspect respiratory series in one study.")
     inspect.add_argument("--dicom-dir", type=Path, required=True)
     inspect.add_argument("--patient-id", required=True)
@@ -63,7 +80,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         inspect_study,
         list_archive_patients,
         list_extracted_patients,
+        list_patient_series,
         list_patient_studies,
+        list_rtstructs,
         prepare_study,
     )
 
@@ -90,6 +109,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Log: {args.log}")
     elif args.command == "list-studies":
         print(list_patient_studies(args.dicom_dir, args.patient_id).to_string(index=False))
+    elif args.command == "list-series":
+        frame = list_patient_series(
+            args.dicom_dir,
+            args.patient_id,
+            study_instance_uid=args.study_uid,
+            modality=args.modality,
+        )
+        print(frame.to_string(index=False))
+    elif args.command == "list-rtstructs":
+        frame = list_rtstructs(
+            args.dicom_dir,
+            args.patient_id,
+            referenced_study_uid=args.referenced_study_uid,
+        )
+        print(frame.to_string(index=False))
     elif args.command == "inspect":
         print(
             inspect_study(args.dicom_dir, args.patient_id, args.study_uid).to_string(
