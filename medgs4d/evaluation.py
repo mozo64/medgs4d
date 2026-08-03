@@ -7,6 +7,9 @@ import json
 import numpy as np
 import pandas as pd
 import torch
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.ticker import MaxNLocator
 
 from .canonical import (
     CanonicalAssets,
@@ -102,6 +105,101 @@ def evaluate_canonical_model(
     return pd.DataFrame(rows)
 
 
+
+def _metric_summary(series: pd.Series) -> dict[str, float]:
+    """Return standard descriptive statistics for one reconstruction metric."""
+
+    return {
+        "Mean": float(series.mean()),
+        "StandardDeviation": float(series.std()),
+        "Minimum": float(series.min()),
+        "Maximum": float(series.max()),
+    }
+
+
+def save_canonical_metrics_pdf(
+    per_slice: pd.DataFrame,
+    output_path: Path,
+    *,
+    study_name: str,
+    canonical_phase: float,
+    iteration: int,
+    target_representation: str,
+) -> Path:
+    """Save publication-ready per-slice PSNR, SSIM, and L1 plots as a PDF."""
+
+    metric_specs = (
+        ("PSNR", "PSNR [dB]", "Higher is better"),
+        ("SSIM", "SSIM", "Higher is better"),
+        ("L1", "L1 error", "Lower is better"),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    pdf_metadata = {
+        "Title": "Canonical MedGS reconstruction metrics",
+        "Subject": (
+            f"{study_name}, phase {canonical_phase:g}%, "
+            f"iteration {iteration}"
+        ),
+        "Creator": "medgs4d",
+    }
+
+    rc = {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+
+    with plt.rc_context(rc), PdfPages(output_path, metadata=pdf_metadata) as pdf:
+        for column, ylabel, interpretation in metric_specs:
+            values = per_slice[column]
+            mean_value = float(values.mean())
+
+            figure, axis = plt.subplots(
+                figsize=(7.2, 4.4),
+                constrained_layout=True,
+            )
+            axis.plot(
+                per_slice["SliceIndex"],
+                values,
+                marker="o",
+                markersize=3,
+                linewidth=1.2,
+                label=column,
+            )
+            axis.axhline(
+                mean_value,
+                linestyle="--",
+                linewidth=1.0,
+                label=f"Mean = {mean_value:.4f}",
+            )
+            axis.set_xlabel("Slice index")
+            axis.set_ylabel(ylabel)
+            axis.set_title(f"Canonical reconstruction: {ylabel}")
+            axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+            axis.grid(True, linewidth=0.5, alpha=0.3)
+            axis.legend(frameon=False)
+
+            figure.text(
+                0.01,
+                0.01,
+                (
+                    f"{study_name} | phase {canonical_phase:g}% | "
+                    f"iteration {iteration} | "
+                    f"target: {target_representation} | {interpretation}"
+                ),
+                fontsize=8,
+            )
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
+
+    return output_path
+
 def save_canonical_evaluation(
     canonical_run_dir: Path,
     medgs_repository: Path,
@@ -109,31 +207,54 @@ def save_canonical_evaluation(
     target_representation: Literal["raw", "denoised"] = "raw",
     device: str = "cuda",
 ) -> Path:
-    """Load and evaluate one canonical run and save CSV and JSON summaries."""
+    """Evaluate one canonical run and save CSV, JSON, and PDF outputs."""
 
+    canonical_run_dir = canonical_run_dir.resolve()
     metadata = json.loads(
         (canonical_run_dir / "canonical_run.json").read_text(encoding="utf-8")
     )
     study = load_study_manifest(Path(metadata["study_dir"]))
     canonical = load_frozen_canonical(
-        canonical_run_dir, medgs_repository, device=device
+        canonical_run_dir,
+        medgs_repository,
+        device=device,
     )
     per_slice = evaluate_canonical_model(
         study,
         canonical,
         target_representation=target_representation,
     )
+
     evaluation_dir = canonical_run_dir / "evaluation"
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     write_dataframe(evaluation_dir / "per_slice.csv", per_slice)
+
+    l1_summary = _metric_summary(per_slice["L1"])
+    psnr_summary = _metric_summary(per_slice["PSNR"])
+    ssim_summary = _metric_summary(per_slice["SSIM"])
     summary = {
+        "StudyName": study.study_name,
+        "CanonicalPhase": float(canonical.config.canonical_phase),
+        "Iteration": int(canonical.loaded_iteration),
         "TargetRepresentation": target_representation,
-        "SliceCount": len(per_slice),
-        "MeanL1": float(per_slice["L1"].mean()),
-        "MeanPSNR": float(per_slice["PSNR"].mean()),
-        "MeanSSIM": float(per_slice["SSIM"].mean()),
+        "SliceCount": int(len(per_slice)),
+        "MeanL1": l1_summary["Mean"],
+        "MeanPSNR": psnr_summary["Mean"],
+        "MeanSSIM": ssim_summary["Mean"],
+        "L1": l1_summary,
+        "PSNR": psnr_summary,
+        "SSIM": ssim_summary,
     }
     write_json(evaluation_dir / "overall.json", summary)
+
+    save_canonical_metrics_pdf(
+        per_slice,
+        evaluation_dir / "canonical_metrics.pdf",
+        study_name=study.study_name,
+        canonical_phase=canonical.config.canonical_phase,
+        iteration=canonical.loaded_iteration,
+        target_representation=target_representation,
+    )
     return evaluation_dir
 
 

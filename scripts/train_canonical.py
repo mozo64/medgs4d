@@ -47,6 +47,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from medgs4d.canonical import train_canonical_model
     from medgs4d.config import CanonicalConfig, validate_canonical_config
     from medgs4d.data import load_study_manifest
+    from medgs4d.evaluation import save_canonical_evaluation
 
     study = load_study_manifest(args.data_dir)
     config = CanonicalConfig(
@@ -70,6 +71,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         force=args.force,
     )
     print(f"Canonical run: {run_dir}")
+
+    evaluation_dir = save_canonical_evaluation(
+        run_dir,
+        args.medgs_repo,
+        target_representation=args.representation,
+        device="cuda",
+    )
+    print(f"Canonical evaluation: {evaluation_dir}")
+    print(f"Canonical metrics PDF: {evaluation_dir / 'canonical_metrics.pdf'}")
     return 0
 
 
