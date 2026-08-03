@@ -1,0 +1,6 @@
+# Existing MedGS4D environment already provides numpy, scipy, pandas, matplotlib and pydicom.
+scikit-image>=0.22
+shapely>=2.0
+plotly>=5.0
+ipywidgets>=8.0
+pytest>=8.0
