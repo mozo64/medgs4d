@@ -200,6 +200,205 @@ def save_canonical_metrics_pdf(
 
     return output_path
 
+
+def _load_csv_or_empty(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def _save_metric_history_pdf(
+    history: pd.DataFrame,
+    output_path: Path,
+    *,
+    x_column: str,
+    title_prefix: str,
+    footer: str,
+    metric_specs: tuple[tuple[str, str, str], ...],
+) -> Path:
+    """Save one PDF page per metric against an ordered training axis."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rc = {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+    with plt.rc_context(rc), PdfPages(output_path) as pdf:
+        for column, ylabel, interpretation in metric_specs:
+            if column not in history.columns:
+                continue
+            values = pd.to_numeric(history[column], errors="coerce")
+            valid = values.notna()
+            if not valid.any():
+                continue
+
+            figure, axis = plt.subplots(
+                figsize=(7.2, 4.4),
+                constrained_layout=True,
+            )
+            axis.plot(
+                history.loc[valid, x_column],
+                values.loc[valid],
+                marker="o",
+                markersize=3,
+                linewidth=1.2,
+                label=column,
+            )
+            axis.set_xlabel(x_column)
+            axis.set_ylabel(ylabel)
+            axis.set_title(f"{title_prefix}: {ylabel}")
+            axis.xaxis.set_major_locator(MaxNLocator(integer=True))
+            axis.grid(True, linewidth=0.5, alpha=0.3)
+            axis.legend(frameon=False)
+            figure.text(
+                0.01,
+                0.01,
+                f"{footer} | {interpretation}",
+                fontsize=8,
+            )
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
+    return output_path
+
+
+def save_canonical_training_history_pdf(
+    canonical_run_dir: Path,
+    *,
+    study_name: str,
+    canonical_phase: float,
+) -> Path | None:
+    """Plot minibatch metrics recorded by the upstream MedGS loop."""
+
+    history_path = canonical_run_dir / "canonical_training_history.csv"
+    history = _load_csv_or_empty(history_path)
+    if history.empty:
+        return None
+
+    history = (
+        history.sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
+    )
+    write_dataframe(history_path, history)
+
+    return _save_metric_history_pdf(
+        history,
+        canonical_run_dir / "canonical_training_history.pdf",
+        x_column="Iteration",
+        title_prefix="Canonical MedGS training",
+        footer=f"{study_name} | phase {canonical_phase:g}%",
+        metric_specs=(
+            ("TotalLoss", "Total loss", "Lower is better"),
+            ("L1", "L1", "Lower is better"),
+            (
+                "InterpolationL1",
+                "Interpolation L1",
+                "Lower is better; active after interpolation warm-up",
+            ),
+            ("PSNR", "PSNR [dB]", "Higher is better"),
+            ("SSIM", "SSIM", "Higher is better"),
+            ("SigmaLoss", "Sigma regularization loss", "Lower is better"),
+            ("GaussianCount", "Gaussian count", "Model size over training"),
+        ),
+    )
+
+
+def _existing_evaluation_history_seed(
+    evaluation_dir: Path,
+) -> pd.DataFrame:
+    history = _load_csv_or_empty(evaluation_dir / "history.csv")
+    if not history.empty:
+        return history
+
+    overall_path = evaluation_dir / "overall.json"
+    if not overall_path.is_file():
+        return pd.DataFrame()
+
+    previous = json.loads(overall_path.read_text(encoding="utf-8"))
+    required = ("Iteration", "MeanL1", "MeanPSNR", "MeanSSIM")
+    if not all(name in previous for name in required):
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        [
+            {
+                "Iteration": int(previous["Iteration"]),
+                "MeanL1": float(previous["MeanL1"]),
+                "MeanPSNR": float(previous["MeanPSNR"]),
+                "MeanSSIM": float(previous["MeanSSIM"]),
+                "SliceCount": int(previous.get("SliceCount", 0)),
+                "TargetRepresentation": previous.get(
+                    "TargetRepresentation",
+                    "",
+                ),
+            }
+        ]
+    )
+
+
+def update_canonical_evaluation_history(
+    evaluation_dir: Path,
+    summary: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Upsert one full-slice evaluation point by checkpoint iteration."""
+
+    history = _existing_evaluation_history_seed(evaluation_dir)
+    row = pd.DataFrame(
+        [
+            {
+                "Iteration": int(summary["Iteration"]),
+                "MeanL1": float(summary["MeanL1"]),
+                "MeanPSNR": float(summary["MeanPSNR"]),
+                "MeanSSIM": float(summary["MeanSSIM"]),
+                "SliceCount": int(summary["SliceCount"]),
+                "TargetRepresentation": summary[
+                    "TargetRepresentation"
+                ],
+            }
+        ]
+    )
+    history = (
+        pd.concat([history, row], ignore_index=True)
+        .sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
+    )
+    write_dataframe(evaluation_dir / "history.csv", history)
+    return history
+
+
+def save_canonical_evaluation_history_pdf(
+    history: pd.DataFrame,
+    output_path: Path,
+    *,
+    study_name: str,
+    canonical_phase: float,
+) -> Path:
+    """Plot full-slice metrics at every completed checkpoint."""
+
+    return _save_metric_history_pdf(
+        history,
+        output_path,
+        x_column="Iteration",
+        title_prefix="Canonical full-slice evaluation",
+        footer=f"{study_name} | phase {canonical_phase:g}%",
+        metric_specs=(
+            ("MeanPSNR", "Mean PSNR [dB]", "Higher is better"),
+            ("MeanSSIM", "Mean SSIM", "Higher is better"),
+            ("MeanL1", "Mean L1", "Lower is better"),
+        ),
+    )
+
+
 def save_canonical_evaluation(
     canonical_run_dir: Path,
     medgs_repository: Path,
@@ -245,6 +444,10 @@ def save_canonical_evaluation(
         "PSNR": psnr_summary,
         "SSIM": ssim_summary,
     }
+    evaluation_history = update_canonical_evaluation_history(
+        evaluation_dir,
+        summary,
+    )
     write_json(evaluation_dir / "overall.json", summary)
 
     save_canonical_metrics_pdf(
@@ -254,6 +457,17 @@ def save_canonical_evaluation(
         canonical_phase=canonical.config.canonical_phase,
         iteration=canonical.loaded_iteration,
         target_representation=target_representation,
+    )
+    save_canonical_evaluation_history_pdf(
+        evaluation_history,
+        evaluation_dir / "history.pdf",
+        study_name=study.study_name,
+        canonical_phase=canonical.config.canonical_phase,
+    )
+    save_canonical_training_history_pdf(
+        canonical_run_dir,
+        study_name=study.study_name,
+        canonical_phase=canonical.config.canonical_phase,
     )
     return evaluation_dir
 

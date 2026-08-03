@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--camera", default="mirror")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=100,
+        help="Append canonical training metrics every N iterations.",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--resume",
@@ -44,6 +50,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Train one named canonical model without overwriting existing results."""
 
     args = build_parser().parse_args(argv)
+    if args.log_every <= 0:
+        raise ValueError("--log-every must be positive")
     from medgs4d.canonical import train_canonical_model
     from medgs4d.config import CanonicalConfig, validate_canonical_config
     from medgs4d.data import load_study_manifest
@@ -69,6 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         config,
         resume=args.resume,
         force=args.force,
+        log_every=args.log_every,
     )
     print(f"Canonical run: {run_dir}")
 
@@ -80,6 +89,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     print(f"Canonical evaluation: {evaluation_dir}")
     print(f"Canonical metrics PDF: {evaluation_dir / 'canonical_metrics.pdf'}")
+    print(f"Canonical evaluation history: {evaluation_dir / 'history.csv'}")
+    print(f"Canonical evaluation history PDF: {evaluation_dir / 'history.pdf'}")
+    print(f"Canonical training history: {run_dir / 'canonical_training_history.csv'}")
+    print(f"Canonical training history PDF: {run_dir / 'canonical_training_history.pdf'}")
     return 0
 
 

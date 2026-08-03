@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -35,6 +36,8 @@ class CanonicalPaths:
     config: Path
     frame_manifest: Path
     metadata: Path
+    training_history: Path
+    training_script: Path
 
 
 @dataclass
@@ -83,6 +86,8 @@ def build_canonical_paths(
         config=root / "config.json",
         frame_manifest=root / "frame_manifest.csv",
         metadata=root / "canonical_run.json",
+        training_history=root / "canonical_training_history.csv",
+        training_script=root / "tools" / "train_with_history.py",
     )
 
 
@@ -175,22 +180,187 @@ def build_canonical_dataset(
     return pd.DataFrame(frame_rows)
 
 
+
+def reconcile_canonical_training_history(
+    path: Path,
+    checkpoint_iteration: int,
+) -> None:
+    """Trim history to the checkpoint used for a resumed run."""
+
+    if not path.is_file():
+        return
+    try:
+        history = pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return
+    if history.empty:
+        return
+
+    history = (
+        history.loc[
+            history["Iteration"].astype(int) <= int(checkpoint_iteration)
+        ]
+        .sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
+    )
+    write_dataframe(path, history)
+
+
+def build_medgs_training_history_script(
+    medgs_repository: Path,
+    destination: Path,
+) -> Path:
+    """Create a private MedGS train.py that appends canonical metrics to CSV."""
+
+    source_path = medgs_repository / "train.py"
+    if not source_path.is_file():
+        raise FileNotFoundError(f"MedGS train.py not found: {source_path}")
+
+    source = source_path.read_text(encoding="utf-8")
+
+    import_anchor = "import copy\n"
+    if import_anchor not in source:
+        raise RuntimeError(
+            "Cannot patch MedGS train.py: import anchor was not found"
+        )
+    source = source.replace(
+        import_anchor,
+        import_anchor + "import csv\n",
+        1,
+    )
+
+    helper_anchor = "\n\ntry:\n    from torch.utils.tensorboard import SummaryWriter\n"
+    if helper_anchor not in source:
+        raise RuntimeError(
+            "Cannot patch MedGS train.py: helper anchor was not found"
+        )
+
+    helper_code = r"""
+_MEDGS_HISTORY_PATH = os.environ.get("MEDGS_TRAINING_HISTORY_PATH")
+_MEDGS_HISTORY_LOG_EVERY = int(
+    os.environ.get("MEDGS_TRAINING_LOG_EVERY", "100")
+)
+_MEDGS_HISTORY_COLUMNS = [
+    "Iteration",
+    "TotalLoss",
+    "L1",
+    "InterpolationL1",
+    "SSIM",
+    "SSIMLoss",
+    "SigmaLoss",
+    "PSNR",
+    "EMALoss",
+    "EMAPSNR",
+    "GaussianCount",
+    "IterationTimeMs",
+    "ElapsedSeconds",
+]
+
+
+def _history_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().item())
+    return float(value)
+
+
+def _append_training_history(row):
+    if not _MEDGS_HISTORY_PATH:
+        return
+
+    directory = os.path.dirname(_MEDGS_HISTORY_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    write_header = (
+        not os.path.isfile(_MEDGS_HISTORY_PATH)
+        or os.path.getsize(_MEDGS_HISTORY_PATH) == 0
+    )
+    with open(
+        _MEDGS_HISTORY_PATH,
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=_MEDGS_HISTORY_COLUMNS,
+        )
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+        stream.flush()
+"""
+    source = source.replace(
+        helper_anchor,
+        "\n\n" + helper_code + helper_anchor,
+        1,
+    )
+
+    loop_anchor = """            total_point = gaussians._xyz.shape[0]
+            if iteration % 100 == 0:
+"""
+    if loop_anchor not in source:
+        raise RuntimeError(
+            "Cannot patch MedGS train.py: canonical logging anchor was not found"
+        )
+
+    logging_code = """            total_point = gaussians._xyz.shape[0]
+            if (
+                _MEDGS_HISTORY_PATH
+                and (
+                    iteration % _MEDGS_HISTORY_LOG_EVERY == 0
+                    or iteration == opt.iterations
+                )
+            ):
+                _append_training_history(
+                    {
+                        "Iteration": int(iteration),
+                        "TotalLoss": _history_float(loss),
+                        "L1": _history_float(Ll1),
+                        "InterpolationL1": _history_float(Ll1_inter),
+                        "SSIM": 1.0 - _history_float(ssim_loss),
+                        "SSIMLoss": _history_float(ssim_loss),
+                        "SigmaLoss": _history_float(sigma_loss),
+                        "PSNR": _history_float(psnr_),
+                        "EMALoss": _history_float(ema_loss_for_log),
+                        "EMAPSNR": _history_float(ema_psnr_for_log),
+                        "GaussianCount": int(total_point),
+                        "IterationTimeMs": float(
+                            iter_start.elapsed_time(iter_end)
+                        ),
+                        "ElapsedSeconds": float(time.time() - init_time),
+                    }
+                )
+            if iteration % 100 == 0:
+"""
+    source = source.replace(loop_anchor, logging_code, 1)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source, encoding="utf-8")
+    return destination
+
+
 def run_medgs_training(
     medgs_repository: Path,
     dataset_dir: Path,
     model_dir: Path,
     config: CanonicalConfig,
     *,
+    training_script: Path,
+    training_history: Path,
+    log_every: int,
     start_checkpoint: Path | None = None,
 ) -> None:
-    """Run upstream MedGS training for the prepared canonical dataset."""
+    """Run upstream MedGS with persistent canonical training history."""
 
-    train_script = medgs_repository / "train.py"
-    if not train_script.is_file():
-        raise FileNotFoundError(f"MedGS train.py not found: {train_script}")
+    patched_script = build_medgs_training_history_script(
+        medgs_repository,
+        training_script,
+    )
     command = [
         sys.executable,
-        str(train_script),
+        str(patched_script),
         "-s",
         str(dataset_dir),
         "-m",
@@ -215,8 +385,27 @@ def run_medgs_training(
     if start_checkpoint is not None:
         command.extend(["--start_checkpoint", str(start_checkpoint)])
 
+    environment = os.environ.copy()
+    environment["MEDGS_TRAINING_HISTORY_PATH"] = str(
+        training_history.resolve()
+    )
+    environment["MEDGS_TRAINING_LOG_EVERY"] = str(int(log_every))
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(medgs_repository.resolve())
+        if not existing_pythonpath
+        else str(medgs_repository.resolve())
+        + os.pathsep
+        + existing_pythonpath
+    )
+
     print("Running:", shlex.join(command), flush=True)
-    subprocess.run(command, cwd=medgs_repository, check=True)
+    subprocess.run(
+        command,
+        cwd=medgs_repository,
+        env=environment,
+        check=True,
+    )
 
 
 def _checkpoint_iteration(path: Path) -> int:
@@ -284,11 +473,14 @@ def train_canonical_model(
     *,
     resume: bool = False,
     force: bool = False,
+    log_every: int = 100,
 ) -> Path:
     """Prepare, train, or resume one static upstream MedGS model."""
 
     if resume and force:
         raise ValueError("--resume and --force are mutually exclusive")
+    if log_every <= 0:
+        raise ValueError("log_every must be positive")
 
     paths = build_canonical_paths(
         output_root, config.study_name, config.run_name
@@ -326,6 +518,10 @@ def train_canonical_model(
                 f"Requested target iteration {config.iterations} must exceed "
                 f"the latest checkpoint iteration {start_iteration}"
             )
+        reconcile_canonical_training_history(
+            paths.training_history,
+            start_iteration,
+        )
 
         print(
             f"Resuming canonical run from iteration {start_iteration}: "
@@ -348,6 +544,9 @@ def train_canonical_model(
         paths.dataset,
         paths.model,
         config,
+        training_script=paths.training_script,
+        training_history=paths.training_history,
+        log_every=log_every,
         start_checkpoint=start_checkpoint,
     )
 
@@ -365,6 +564,9 @@ def train_canonical_model(
         "dataset_dir": str(paths.dataset.resolve()),
         "model_dir": str(paths.model.resolve()),
         "checkpoint": str(checkpoint.resolve()),
+        "training_history": str(paths.training_history.resolve()),
+        "training_script": str(paths.training_script.resolve()),
+        "training_log_every": int(log_every),
     }
     if start_checkpoint is not None:
         metadata["resumed_from_checkpoint"] = str(
