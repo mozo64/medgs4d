@@ -1,136 +1,125 @@
 # MedGS4D
 
-Working repository for 4D medical Gaussian Splatting experiments on dynamic CT data.
+A small research codebase for phase-conditioned reconstruction of respiratory
+4D-CT with a frozen canonical [MedGS](https://github.com/gmum/MedGS) model and
+a trainable deformation MLP.
 
-The project is based on [GMUM MedGS](https://github.com/gmum/MedGS) and focuses on the practical preparation layer for 4D experiments: CUDA environment setup, TCIA 4D-Lung download, DICOM inspection, respiratory-phase exploration, and preliminary visualization.
+The long development notebooks are not part of the execution pipeline. Data
+preparation, canonical training, dynamic training, evaluation, reporting, and
+static visualization are exposed through command-line scripts. The included
+notebook only reads completed runs.
 
-## Repository structure
+## Repository layout
 
 ```text
 medgs4d/
-├── README.md
-├── docs/
-│   └── medgs_clean_install_guide.md
+├── medgs4d/                 reusable Python package
+│   ├── config.py
+│   ├── runs.py
+│   ├── data.py
+│   ├── splits.py
+│   ├── canonical.py
+│   ├── deformation.py
+│   ├── training.py
+│   ├── evaluation.py
+│   ├── reporting.py
+│   ├── results.py
+│   └── visualization.py
+├── scripts/                 thin command-line entry points
 ├── notebooks/
-│   └── explore_4d_lung.ipynb
-└── scripts/
-    ├── download_all_series.py
-    └── pycharm_env_check.py
+│   └── results_browser.ipynb
+├── tests/
+└── pyproject.toml
 ```
 
-## Files
+The upstream MedGS repository is cloned separately and passed through
+`--medgs-repo`. MedGS4D does not vendor or modify its renderer.
 
-| Path | Purpose |
-|---|---|
-| `docs/medgs_clean_install_guide.md` | Environment setup notes for the Ubuntu/CUDA server used to run and test MedGS. |
-| `notebooks/explore_4d_lung.ipynb` | Exploratory notebook for TCIA 4D-Lung metadata, DICOM unpacking, respiratory phases, and slice visualization. |
-| `scripts/download_all_series.py` | Downloader for TCIA 4D-Lung series through the NBIA API. It saves one ZIP per DICOM series and logs download status. |
-| `scripts/pycharm_env_check.py` | Smoke test for the MedGS Python/CUDA environment. |
+## Data and output contracts
 
-## Upstream dependency
-
-The upstream MedGS repository should be cloned separately:
+Prepared study:
 
 ```text
-https://github.com/gmum/MedGS
+<prepared-root>/<study-name>/
+├── manifest.json
+├── phase_summary.csv
+├── phase_slice_manifest.csv
+└── volumes/
+    ├── raw/phase_*.npy
+    └── denoised/phase_*.npy
 ```
 
-This repository contains the auxiliary workflow around MedGS, not a vendored copy of the upstream code.
-
-## Data source
-
-The initial dynamic CT dataset is TCIA 4D-Lung:
+Canonical run:
 
 ```text
-https://www.cancerimagingarchive.net/collection/4d-lung/
+<canonical-output-root>/<study-name>/<run-name>/
+├── config.json
+├── canonical_run.json
+├── frame_manifest.csv
+├── dataset/{original,mirror}/
+└── model/
 ```
 
-The downloaded data should be stored outside Git. The scripts and notebook currently define local path constants near the top of the file; edit these paths to match your own server or workstation layout.
-
-Examples of constants to adjust:
-
-```python
-ROOT = Path(".../data/tcia_4d_lung")
-MEDGS_ROOT = Path("...")
-```
-
-Expected data layout:
+Dynamic run:
 
 ```text
-tcia_4d_lung/
-├── metadata/
-│   ├── patients.json
-│   ├── series.json
-│   ├── series_summary.csv
-│   └── download_log.csv
-├── raw/
-│   ├── series_zips/
-│   └── dicom_by_series/
-└── processed/
+<results-root>/<study-name>/<run-name>/
+├── config.json
+├── split_manifest.csv
+├── sampling_plan.csv
+├── training_history.csv
+├── validation_history.csv       optional
+├── training_summary.csv
+├── completion.json
+├── checkpoints/
+├── evaluation/
+│   ├── per_slice.csv
+│   ├── per_phase.csv
+│   └── overall.json
+├── report_metrics.csv
+├── report.pdf
+└── visualizations/
 ```
 
-## Notebook environment
+Existing study and run directories are never overwritten implicitly. Training
+requires a new `--run-name`, `--resume`, or explicit `--force`.
 
-The notebook uses the same Python/CUDA environment as MedGS. After creating and validating the MedGS environment, install the notebook-related packages into that environment:
+## Command groups
+
+```text
+python scripts/data.py list-patients ...
+python scripts/data.py extract ...
+python scripts/data.py list-studies ...
+python scripts/data.py inspect ...
+python scripts/data.py prepare ...
+
+python scripts/train_canonical.py ...
+python scripts/evaluate_canonical.py ...
+python scripts/train_medgs4d.py ...
+python scripts/evaluate_medgs4d.py ...
+python scripts/visualize_medgs4d.py ...
+```
+
+`train_medgs4d.py` supports `full` and `phase-holdout` splits. Its architecture
+and optimization parameters are explicit CLI arguments rather than historical
+notebook experiment names. A completed training run performs final evaluation
+and writes a minimalist vector `report.pdf` unless
+`--skip-final-evaluation` is supplied.
+
+## Tests
+
+Fast tests do not require MedGS, CUDA, or real DICOM files:
 
 ```bash
-pip install jupyter ipykernel pydicom pandas ipywidgets
+python -m pytest -q
 ```
 
-Register the environment as a Jupyter kernel:
+The optional WORF integration test loads a real run and renders one image:
 
 ```bash
-python -m ipykernel install \
-  --prefix "$CONDA_PREFIX" \
-  --name medgs38 \
-  --display-name "Python (medgs38 MedGS)"
+MEDGS4D_TEST_RUN_DIR=/absolute/path/to/run \
+python -m pytest -q -m worf
 ```
 
-In PyCharm or Jupyter, select:
-
-```text
-Python (medgs38 MedGS)
-```
-
-or directly use the Python interpreter from the MedGS environment.
-
-## Running the TCIA downloader
-
-Before running the downloader, create or obtain a TCIA series manifest:
-
-```text
-data/tcia_4d_lung/metadata/series.json
-```
-
-Then edit the `ROOT` constant in `scripts/download_all_series.py` so that it points to your local TCIA 4D-Lung data directory.
-
-Run:
-
-```bash
-python scripts/download_all_series.py
-```
-
-The script writes downloaded ZIP files under:
-
-```text
-raw/series_zips/
-```
-
-and logs progress to:
-
-```text
-metadata/download_log.csv
-```
-
-For long downloads, run the command inside `tmux`:
-
-```bash
-tmux new -s tcia4dlung
-python scripts/download_all_series.py
-```
-
-Reconnect after SSH interruption with:
-
-```bash
-tmux attach -t tcia4dlung
-```
+The MedGS Python/CUDA environment must already contain PyTorch and the compiled
+MedGS rasterizer extensions.

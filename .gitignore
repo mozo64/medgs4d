@@ -227,3 +227,4 @@ output/
 *.pth
 *.ply
 .ipynb_checkpoints/
+.venv/
