@@ -26,7 +26,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--camera", default="mirror")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--force", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing run from its latest chkpnt*.pth checkpoint.",
+    )
+    mode.add_argument(
+        "--force",
+        action="store_true",
+        help="Delete and recreate only the selected run directory.",
+    )
     return parser
 
 
@@ -56,6 +66,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.medgs_repo,
         args.output_root,
         config,
+        resume=args.resume,
         force=args.force,
     )
     print(f"Canonical run: {run_dir}")

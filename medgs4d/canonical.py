@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -179,6 +180,8 @@ def run_medgs_training(
     dataset_dir: Path,
     model_dir: Path,
     config: CanonicalConfig,
+    *,
+    start_checkpoint: Path | None = None,
 ) -> None:
     """Run upstream MedGS training for the prepared canonical dataset."""
 
@@ -209,8 +212,68 @@ def run_medgs_training(
         "--camera",
         config.camera,
     ]
+    if start_checkpoint is not None:
+        command.extend(["--start_checkpoint", str(start_checkpoint)])
+
     print("Running:", shlex.join(command), flush=True)
     subprocess.run(command, cwd=medgs_repository, check=True)
+
+
+def _checkpoint_iteration(path: Path) -> int:
+    """Return the iteration encoded in a chkpnt<iteration>.pth filename."""
+
+    match = re.fullmatch(r"chkpnt(\d+)\.pth", path.name)
+    if match is None:
+        raise ValueError(f"Invalid canonical checkpoint name: {path.name}")
+    return int(match.group(1))
+
+
+def latest_canonical_checkpoint(model_dir: Path) -> tuple[Path, int]:
+    """Find the newest canonical checkpoint saved by upstream MedGS."""
+
+    checkpoints = []
+    for path in model_dir.glob("chkpnt*.pth"):
+        match = re.fullmatch(r"chkpnt(\d+)\.pth", path.name)
+        if match is not None:
+            checkpoints.append((int(match.group(1)), path))
+
+    if not checkpoints:
+        raise FileNotFoundError(f"No canonical checkpoint found in: {model_dir}")
+
+    iteration, path = max(checkpoints, key=lambda item: item[0])
+    return path, iteration
+
+
+def _validate_resume_config(
+    existing: CanonicalConfig,
+    requested: CanonicalConfig,
+) -> None:
+    """Allow only the target iteration to change when resuming a run."""
+
+    fields = (
+        "study_name",
+        "run_name",
+        "canonical_phase",
+        "representation",
+        "poly_degree",
+        "batch_size",
+        "camera",
+        "seed",
+    )
+    mismatches = [
+        name
+        for name in fields
+        if getattr(existing, name) != getattr(requested, name)
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{name}: {getattr(existing, name)!r} != "
+            f"{getattr(requested, name)!r}"
+            for name in mismatches
+        )
+        raise ValueError(
+            "Cannot resume with changed canonical configuration: " + details
+        )
 
 
 def train_canonical_model(
@@ -219,38 +282,97 @@ def train_canonical_model(
     output_root: Path,
     config: CanonicalConfig,
     *,
+    resume: bool = False,
     force: bool = False,
 ) -> Path:
-    """Prepare a canonical dataset and train one static upstream MedGS model."""
+    """Prepare, train, or resume one static upstream MedGS model."""
+
+    if resume and force:
+        raise ValueError("--resume and --force are mutually exclusive")
 
     paths = build_canonical_paths(
         output_root, config.study_name, config.run_name
     )
-    prepare_output_directory(paths.root, force=force, resume=False)
-    save_config(config, paths.config)
-    frame_manifest = build_canonical_dataset(
-        study,
+
+    start_checkpoint = None
+    start_iteration = None
+
+    if resume:
+        if not paths.root.is_dir():
+            raise FileNotFoundError(
+                f"Canonical run does not exist: {paths.root}"
+            )
+        if not paths.config.is_file():
+            raise FileNotFoundError(
+                f"Canonical config does not exist: {paths.config}"
+            )
+        if not paths.frame_manifest.is_file():
+            raise FileNotFoundError(
+                f"Canonical frame manifest does not exist: "
+                f"{paths.frame_manifest}"
+            )
+        if not (paths.dataset / "original").is_dir():
+            raise FileNotFoundError(
+                f"Canonical dataset does not exist: {paths.dataset}"
+            )
+
+        existing_config = load_canonical_config(paths.config)
+        _validate_resume_config(existing_config, config)
+        start_checkpoint, start_iteration = latest_canonical_checkpoint(
+            paths.model
+        )
+        if config.iterations <= start_iteration:
+            raise ValueError(
+                f"Requested target iteration {config.iterations} must exceed "
+                f"the latest checkpoint iteration {start_iteration}"
+            )
+
+        print(
+            f"Resuming canonical run from iteration {start_iteration}: "
+            f"{start_checkpoint}",
+            flush=True,
+        )
+    else:
+        prepare_output_directory(paths.root, force=force, resume=False)
+        save_config(config, paths.config)
+        frame_manifest = build_canonical_dataset(
+            study,
+            paths.dataset,
+            canonical_phase=config.canonical_phase,
+            representation=config.representation,
+        )
+        write_dataframe(paths.frame_manifest, frame_manifest)
+
+    run_medgs_training(
+        medgs_repository,
         paths.dataset,
-        canonical_phase=config.canonical_phase,
-        representation=config.representation,
+        paths.model,
+        config,
+        start_checkpoint=start_checkpoint,
     )
-    write_dataframe(paths.frame_manifest, frame_manifest)
-    write_json(
-        paths.metadata,
-        {
-            "study_dir": str(study.root.resolve()),
-            "medgs_repository": str(medgs_repository.resolve()),
-            "dataset_dir": str(paths.dataset.resolve()),
-            "model_dir": str(paths.model.resolve()),
-            "checkpoint": str(
-                (paths.model / f"chkpnt{config.iterations}.pth").resolve()
-            ),
-        },
-    )
-    run_medgs_training(medgs_repository, paths.dataset, paths.model, config)
+
     checkpoint = paths.model / f"chkpnt{config.iterations}.pth"
     if not checkpoint.is_file():
-        raise FileNotFoundError(f"Expected canonical checkpoint was not saved: {checkpoint}")
+        raise FileNotFoundError(
+            f"Expected canonical checkpoint was not saved: {checkpoint}"
+        )
+
+    # On resume, update the public metadata only after successful training.
+    save_config(config, paths.config)
+    metadata = {
+        "study_dir": str(study.root.resolve()),
+        "medgs_repository": str(medgs_repository.resolve()),
+        "dataset_dir": str(paths.dataset.resolve()),
+        "model_dir": str(paths.model.resolve()),
+        "checkpoint": str(checkpoint.resolve()),
+    }
+    if start_checkpoint is not None:
+        metadata["resumed_from_checkpoint"] = str(
+            start_checkpoint.resolve()
+        )
+        metadata["resumed_from_iteration"] = int(start_iteration)
+
+    write_json(paths.metadata, metadata)
     return paths.root
 
 
