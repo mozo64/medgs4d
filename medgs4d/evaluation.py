@@ -935,3 +935,180 @@ def evaluate_run(
 
         generate_run_report(run_dir)
     return run_dir / "evaluation"
+
+
+def read_dynamic_checkpoint_iteration(checkpoint: Path) -> int:
+    """Read the saved iteration from a deformation checkpoint payload."""
+
+    payload = torch.load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=False,
+    )
+    return int(payload["iteration"])
+
+
+def discover_dynamic_checkpoints(
+    run_dir: Path,
+    *,
+    iterations: list[int] | None = None,
+) -> list[Path]:
+    """Find saved iteration checkpoints and optionally select exact iterations."""
+
+    checkpoint_dir = run_dir.resolve() / "checkpoints"
+    by_iteration: dict[int, Path] = {}
+
+    for checkpoint in checkpoint_dir.glob("deformation_iter_*.pth"):
+        iteration = read_dynamic_checkpoint_iteration(checkpoint)
+        by_iteration[iteration] = checkpoint.resolve()
+
+    if not by_iteration:
+        raise FileNotFoundError(
+            f"No deformation_iter_*.pth checkpoints found in {checkpoint_dir}"
+        )
+
+    if iterations is not None:
+        missing = sorted(set(int(value) for value in iterations) - set(by_iteration))
+        if missing:
+            raise FileNotFoundError(
+                f"Missing deformation checkpoints for iterations: {missing}"
+            )
+        selected = [by_iteration[int(value)] for value in iterations]
+    else:
+        selected = [by_iteration[key] for key in sorted(by_iteration)]
+
+    return selected
+
+
+def _checkpoint_comparison_row(
+    overall: Mapping[str, Any],
+    *,
+    checkpoint: Path,
+    split: EvaluationSplit,
+) -> dict[str, Any]:
+    row = _dynamic_evaluation_history_row(overall)
+    row["Checkpoint"] = str(checkpoint.resolve())
+    row["Split"] = split
+    row["SampleCount"] = int(
+        overall.get("AllNoncanonical", {}).get("SampleCount", 0)
+    )
+    return row
+
+
+def evaluate_checkpoints(
+    run_dir: Path,
+    *,
+    checkpoints: list[Path] | None = None,
+    iterations: list[int] | None = None,
+    split: EvaluationSplit = "all",
+    force: bool = False,
+    device: str = "cuda",
+) -> Path:
+    """Fully evaluate several deformation checkpoints and compare them."""
+
+    run_dir = run_dir.resolve()
+    config = load_medgs4d_config(run_dir / "config.json")
+    study = load_study_manifest(Path(config.data_dir))
+    canonical = load_frozen_canonical(
+        Path(config.canonical_model_dir),
+        Path(config.medgs_repository),
+        checkpoint=(
+            Path(config.canonical_checkpoint)
+            if config.canonical_checkpoint
+            else None
+        ),
+        device=device,
+    )
+    field = DeformationField(
+        canonical,
+        config.deformation,
+        config.canonical_phase,
+        seed=config.training.seed,
+    )
+    split_manifest = pd.read_csv(run_dir / "split_manifest.csv")
+
+    if checkpoints is not None and iterations is not None:
+        raise ValueError("Provide checkpoints or iterations, not both")
+
+    selected = (
+        [Path(path).resolve() for path in checkpoints]
+        if checkpoints is not None
+        else discover_dynamic_checkpoints(
+            run_dir,
+            iterations=iterations,
+        )
+    )
+
+    comparison_rows = []
+    checkpoints_root = run_dir / "evaluation" / "checkpoints"
+    checkpoints_root.mkdir(parents=True, exist_ok=True)
+
+    for checkpoint in selected:
+        iteration = read_dynamic_checkpoint_iteration(checkpoint)
+        checkpoint_dir = checkpoints_root / f"iter_{iteration:06d}"
+        per_slice_path = checkpoint_dir / "per_slice.csv"
+        per_phase_path = checkpoint_dir / "per_phase.csv"
+        overall_path = checkpoint_dir / "overall.json"
+
+        if (
+            not force
+            and per_slice_path.is_file()
+            and per_phase_path.is_file()
+            and overall_path.is_file()
+        ):
+            overall = json.loads(overall_path.read_text(encoding="utf-8"))
+        else:
+            load_checkpoint(
+                checkpoint,
+                field,
+                device=device,
+                config=config,
+            )
+            per_slice = evaluate_medgs4d_model(
+                study,
+                canonical,
+                field,
+                split_manifest,
+                split=split,
+                target_representation=config.target_representation,
+            )
+            per_phase = aggregate_metrics_per_phase(per_slice)
+            overall = aggregate_metrics_overall(per_slice)
+            overall["Checkpoint"] = str(checkpoint)
+            overall["CheckpointIteration"] = iteration
+            overall["CanonicalCheckpoint"] = config.canonical_checkpoint
+            overall["CanonicalCheckpointIteration"] = (
+                config.canonical_checkpoint_iteration
+            )
+            overall["Split"] = split
+
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            write_dataframe(per_slice_path, per_slice)
+            write_dataframe(per_phase_path, per_phase)
+            write_json(overall_path, overall)
+
+        comparison_rows.append(
+            _checkpoint_comparison_row(
+                overall,
+                checkpoint=checkpoint,
+                split=split,
+            )
+        )
+        print(
+            f"Evaluated checkpoint {iteration}: {checkpoint_dir}",
+            flush=True,
+        )
+
+    comparison = (
+        pd.DataFrame(comparison_rows)
+        .sort_values("CheckpointIteration")
+        .drop_duplicates("CheckpointIteration", keep="last")
+        .reset_index(drop=True)
+    )
+    comparison_path = run_dir / "evaluation" / "checkpoint_comparison.csv"
+    write_dataframe(comparison_path, comparison)
+    save_dynamic_evaluation_history_pdf(
+        comparison,
+        run_dir / "evaluation" / "checkpoint_comparison.pdf",
+    )
+    return comparison_path
