@@ -38,6 +38,7 @@ medgs4d/
 │   ├── evaluate_medgs4d.py
 │   ├── evaluate_checkpoints.py
 │   ├── diagnose_deformation.py
+│   ├── export_error_maps.py
 │   └── visualize_medgs4d.py
 ├── notebooks/
 │   └── results_browser.ipynb
@@ -675,6 +676,74 @@ Artifacts:
 
 At the canonical phase, the residual should be numerically close to zero because deformation is defined relative to the canonical MLP output.
 
+### 3.11 Export reconstruction error maps from the command line
+
+Static error-map grids can be exported without opening a notebook.
+
+Export selected holdout phases for one slice:
+
+```bash
+$PYTHON scripts/export_error_maps.py \
+  --run-dir "$RUN_DIR" \
+  --phases 10 30 50 70 90 \
+  --slices 27 \
+  --device cuda
+```
+
+Without `--phases`, every prepared respiratory phase is exported. Without `--slices`, the middle slice is used:
+
+```bash
+$PYTHON scripts/export_error_maps.py \
+  --run-dir "$RUN_DIR" \
+  --device cuda
+```
+
+Use an exact dynamic checkpoint instead of `deformation_latest.pth`:
+
+```bash
+$PYTHON scripts/export_error_maps.py \
+  --run-dir "$RUN_DIR" \
+  --checkpoint "$RUN_DIR/checkpoints/deformation_iter_000500.pth" \
+  --phases 10 30 50 70 90 \
+  --slices 27 \
+  --device cuda
+```
+
+For figures that must share the same absolute-error scale, provide an explicit upper limit:
+
+```bash
+$PYTHON scripts/export_error_maps.py \
+  --run-dir "$RUN_DIR" \
+  --phases 10 30 50 70 90 \
+  --slices 27 \
+  --error-max 0.25 \
+  --device cuda
+```
+
+Outputs are written to:
+
+```text
+<RUN_DIR>/visualizations/error_maps/
+├── phase_10_slice_027.png
+├── phase_30_slice_027.png
+├── phase_50_slice_027.png
+├── phase_70_slice_027.png
+└── phase_90_slice_027.png
+```
+
+Each PNG contains:
+
+```text
+Ground truth
+Canonical baseline
+Dynamic reconstruction
+|GT - baseline|
+|GT - dynamic|
+Error reduction
+```
+
+The two absolute-error panels use the same scale. In `Error reduction`, positive values mean that the dynamic model reduced the error, while negative values mean that the canonical baseline was locally better. When `--error-max` is omitted, each figure derives its scale from the joint 99th percentile of the two absolute-error maps. Re-running the same phase and slice replaces the corresponding PNG.
+
 ## 4. Notebook inspection
 
 Use the repository's `MedGS WORF` kernel or another kernel backed by the same editable installation.
@@ -902,6 +971,14 @@ diagnose_deformation.py:
   --phases PHASE [PHASE ...]
   --sample-gaussians N
   --seed
+  --device
+
+export_error_maps.py:
+  --run-dir
+  --phases PHASE [PHASE ...]
+  --slices INDEX [INDEX ...]
+  --checkpoint
+  --error-max VALUE
   --device
 
 visualize_medgs4d.py:
