@@ -78,6 +78,8 @@ class MedGS4DConfig:
     deformation: DeformationConfig
     training: TrainingConfig
     target_representation: Representation = "raw"
+    canonical_checkpoint: str = ""
+    canonical_checkpoint_iteration: int = 0
 
 
 T = TypeVar("T")
@@ -162,6 +164,8 @@ def validate_medgs4d_config(config: MedGS4DConfig) -> None:
         raise ValueError("smoothness_gaussians must be positive")
     if training.phase_jitter_initial_std < 0:
         raise ValueError("phase jitter standard deviation cannot be negative")
+    if config.canonical_checkpoint_iteration < 0:
+        raise ValueError("canonical checkpoint iteration cannot be negative")
 
 
 def config_to_dict(config: Any) -> dict[str, Any]:

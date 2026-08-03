@@ -68,6 +68,7 @@ class CanonicalAssets:
     background: torch.Tensor
     dataset_args: Namespace
     loaded_iteration: int
+    checkpoint_path: Path
     runtime: MedGSRuntime
 
 
@@ -583,10 +584,56 @@ def _read_canonical_metadata(run_dir: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+
+def resolve_canonical_checkpoint(
+    canonical_run_dir: Path,
+    checkpoint: Path | None = None,
+) -> tuple[Path, int]:
+    """Resolve and validate the canonical checkpoint selected for loading."""
+
+    canonical_run_dir = canonical_run_dir.resolve()
+    model_dir = canonical_run_dir / "model"
+    config = load_canonical_config(canonical_run_dir / "config.json")
+
+    checkpoint_path = (
+        checkpoint.resolve()
+        if checkpoint is not None
+        else model_dir / f"chkpnt{config.iterations}.pth"
+    )
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Canonical checkpoint does not exist: {checkpoint_path}"
+        )
+    if checkpoint_path.parent.resolve() != model_dir.resolve():
+        raise ValueError(
+            "Canonical checkpoint must belong to the selected canonical run: "
+            f"{checkpoint_path}"
+        )
+
+    filename_iteration = _checkpoint_iteration(checkpoint_path)
+    payload = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(payload, (tuple, list)) or len(payload) != 2:
+        raise ValueError(
+            f"Unexpected canonical checkpoint format: {checkpoint_path}"
+        )
+    loaded_iteration = int(payload[1])
+    if loaded_iteration != filename_iteration:
+        raise ValueError(
+            f"Checkpoint filename iteration {filename_iteration} does not "
+            f"match saved iteration {loaded_iteration}: {checkpoint_path}"
+        )
+    return checkpoint_path, loaded_iteration
+
+
 def load_frozen_canonical(
     canonical_run_dir: Path,
     medgs_repository: Path | None = None,
     *,
+    checkpoint: Path | None = None,
     device: str = "cuda",
 ) -> CanonicalAssets:
     """Load one trained canonical MedGS model and freeze all Gaussian parameters."""
@@ -602,7 +649,10 @@ def load_frozen_canonical(
     runtime = load_medgs_runtime(repository)
     model_dir = canonical_run_dir / "model"
     dataset_dir = canonical_run_dir / "dataset"
-    checkpoint_path = model_dir / f"chkpnt{config.iterations}.pth"
+    checkpoint_path, selected_iteration = resolve_canonical_checkpoint(
+        canonical_run_dir,
+        checkpoint,
+    )
     cfg_path = model_dir / "cfg_args"
     frame_manifest = pd.read_csv(canonical_run_dir / "frame_manifest.csv")
     if not checkpoint_path.is_file() or not cfg_path.is_file():
@@ -624,11 +674,14 @@ def load_frozen_canonical(
         raise ValueError("Canonical image count does not match frame_manifest.csv")
 
     model_state, loaded_iteration = torch.load(
-        checkpoint_path, map_location=device, weights_only=False
+        checkpoint_path,
+        map_location=device,
+        weights_only=False,
     )
-    if int(loaded_iteration) != config.iterations:
+    if int(loaded_iteration) != selected_iteration:
         raise ValueError(
-            f"Checkpoint iteration {loaded_iteration} does not match config {config.iterations}"
+            f"Loaded checkpoint iteration {loaded_iteration} does not match "
+            f"the selected iteration {selected_iteration}"
         )
 
     gaussians = runtime.gaussian_model_factory["gs"](
@@ -697,6 +750,7 @@ def load_frozen_canonical(
         background=background,
         dataset_args=dataset_args,
         loaded_iteration=int(loaded_iteration),
+        checkpoint_path=checkpoint_path,
         runtime=runtime,
     )
 

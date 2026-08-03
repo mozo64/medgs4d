@@ -17,6 +17,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a phase-conditioned MedGS4D model.")
     parser.add_argument("--data-dir", type=Path, required=True)
     parser.add_argument("--canonical-model", type=Path, required=True)
+    parser.add_argument(
+        "--canonical-checkpoint",
+        type=Path,
+        help="Exact canonical chkpnt*.pth to freeze; defaults to the run config.",
+    )
     parser.add_argument("--medgs-repo", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--run-name", required=True)
@@ -40,12 +45,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-final-evaluation", action="store_true")
     policy = parser.add_mutually_exclusive_group()
     policy.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--resume-checkpoint",
+        type=Path,
+        help="Exact deformation checkpoint to resume instead of deformation_latest.pth.",
+    )
     policy.add_argument("--force", action="store_true")
     parser.add_argument("--device", default="cuda")
     return parser
 
 
-def config_from_args(args: argparse.Namespace, study_name: str):
+def config_from_args(
+    args: argparse.Namespace,
+    study_name: str,
+    *,
+    canonical_checkpoint: Path,
+    canonical_checkpoint_iteration: int,
+):
     """Create the complete saved training configuration from CLI arguments."""
 
     from medgs4d.config import (
@@ -84,6 +100,8 @@ def config_from_args(args: argparse.Namespace, study_name: str):
             phase_jitter_initial_std=args.phase_jitter_std,
         ),
         target_representation=args.target_representation,
+        canonical_checkpoint=str(canonical_checkpoint.resolve()),
+        canonical_checkpoint_iteration=int(canonical_checkpoint_iteration),
     )
 
 
@@ -91,6 +109,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Start, resume, or force-restart one named MedGS4D run."""
 
     args = build_parser().parse_args(argv)
+    if args.resume_checkpoint is not None and not args.resume:
+        raise ValueError("--resume-checkpoint requires --resume")
+
     from medgs4d.canonical import load_frozen_canonical
     from medgs4d.config import (
         load_medgs4d_config,
@@ -105,24 +126,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     from medgs4d.training import train_medgs4d
 
     study = load_study_manifest(args.data_dir)
-    config = config_from_args(args, study.study_name)
-    validate_medgs4d_config(config)
-    run_paths = build_run_paths(args.output_root, study.study_name, args.run_name)
-    prepare_output_directory(run_paths.root, force=args.force, resume=args.resume)
+    run_paths = build_run_paths(
+        args.output_root,
+        study.study_name,
+        args.run_name,
+    )
+
+    saved = None
     if args.resume:
+        if not run_paths.config.is_file():
+            raise FileNotFoundError(
+                f"Cannot resume without saved config: {run_paths.config}"
+            )
         saved = load_medgs4d_config(run_paths.config)
-        assert_resume_compatible(saved, config)
+
+    selected_canonical_checkpoint = args.canonical_checkpoint
+    if (
+        selected_canonical_checkpoint is None
+        and saved is not None
+        and saved.canonical_checkpoint
+    ):
+        selected_canonical_checkpoint = Path(saved.canonical_checkpoint)
+
     canonical = load_frozen_canonical(
-        args.canonical_model, args.medgs_repo, device=args.device
+        args.canonical_model,
+        args.medgs_repo,
+        checkpoint=selected_canonical_checkpoint,
+        device=args.device,
     )
     if abs(canonical.config.canonical_phase - args.canonical_phase) > 1e-6:
         raise ValueError("Dynamic and canonical model phases do not match")
+
+    config = config_from_args(
+        args,
+        study.study_name,
+        canonical_checkpoint=canonical.checkpoint_path,
+        canonical_checkpoint_iteration=canonical.loaded_iteration,
+    )
+    validate_medgs4d_config(config)
+
+    prepare_output_directory(
+        run_paths.root,
+        force=args.force,
+        resume=args.resume,
+    )
+    if saved is not None:
+        assert_resume_compatible(saved, config)
+
     output = train_medgs4d(
         study,
         canonical,
         run_paths,
         config,
         resume=args.resume,
+        resume_checkpoint=args.resume_checkpoint,
         final_evaluation=not args.skip_final_evaluation,
     )
     print(f"MedGS4D run: {output}")

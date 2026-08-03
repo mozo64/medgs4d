@@ -128,21 +128,68 @@ def load_or_create_sampling_plan(
     canonical_phase: float,
     phase_jitter_initial_std: float,
     resume: bool,
+    checkpoint_iteration: int = 0,
 ) -> pd.DataFrame:
-    """Reuse a saved plan on resume or create it for a new run."""
+    """Create, reuse, trim, or deterministically extend a sampling plan."""
 
-    if resume:
-        plan = pd.read_csv(path)
-        if len(plan) != iterations:
-            raise ValueError("Saved sampling plan does not match requested iterations")
+    if not resume:
+        plan = build_sampling_plan(
+            train_rows,
+            iterations=iterations,
+            seed=seed,
+            canonical_phase=canonical_phase,
+            phase_jitter_initial_std=phase_jitter_initial_std,
+        )
+        write_dataframe(path, plan)
         return plan
-    plan = build_sampling_plan(
-        train_rows,
-        iterations=iterations,
-        seed=seed,
-        canonical_phase=canonical_phase,
-        phase_jitter_initial_std=phase_jitter_initial_std,
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Saved sampling plan does not exist: {path}")
+
+    plan = pd.read_csv(path)
+    if len(plan) < checkpoint_iteration:
+        raise ValueError(
+            f"Sampling plan has {len(plan)} rows but checkpoint is at "
+            f"iteration {checkpoint_iteration}"
+        )
+    if iterations < checkpoint_iteration:
+        raise ValueError(
+            f"Requested target iteration {iterations} is earlier than "
+            f"resume checkpoint {checkpoint_iteration}"
+        )
+
+    plan = (
+        plan.sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
     )
+
+    if len(plan) > iterations:
+        plan = plan.iloc[:iterations].copy()
+
+    if len(plan) < iterations:
+        existing_count = len(plan)
+        additional_count = iterations - existing_count
+        continuing_jitter_std = (
+            float(plan.iloc[-1]["PhaseJitterStd"])
+            if existing_count and "PhaseJitterStd" in plan
+            else phase_jitter_initial_std
+        )
+        extension = build_sampling_plan(
+            train_rows,
+            iterations=additional_count,
+            seed=seed + existing_count + 1,
+            canonical_phase=canonical_phase,
+            phase_jitter_initial_std=continuing_jitter_std,
+        )
+        extension = extension.copy()
+        extension["Iteration"] = np.arange(
+            existing_count + 1,
+            iterations + 1,
+            dtype=np.int64,
+        )
+        plan = pd.concat([plan, extension], ignore_index=True)
+
     write_dataframe(path, plan)
     return plan
 
@@ -307,6 +354,8 @@ def save_checkpoint(
             "study_name": config.study_name,
             "run_name": config.run_name,
             "canonical_phase": config.canonical_phase,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": config.canonical_checkpoint_iteration,
             "parameter_count": field.parameter_count,
         },
         "torch_rng_state": torch.get_rng_state(),
@@ -325,13 +374,55 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     *,
     device: str,
+    config: MedGS4DConfig | None = None,
 ) -> int:
-    """Restore model and optional optimizer state and return the saved iteration."""
+    """Restore a deformation checkpoint and optionally validate its run identity."""
 
     payload = torch.load(path, map_location=device, weights_only=False)
-    field.model.load_state_dict(payload["deformation_mlp_state_dict"], strict=True)
+    checkpoint_config = payload.get("config", {})
+
+    if config is not None:
+        expected = {
+            "study_name": config.study_name,
+            "run_name": config.run_name,
+            "canonical_phase": config.canonical_phase,
+            "parameter_count": field.parameter_count,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": config.canonical_checkpoint_iteration,
+        }
+        mismatches = []
+        for key, expected_value in expected.items():
+            if key not in checkpoint_config:
+                continue
+            actual_value = checkpoint_config[key]
+            if isinstance(expected_value, float):
+                matches = abs(float(actual_value) - expected_value) <= 1e-6
+            else:
+                matches = actual_value == expected_value
+            if not matches:
+                mismatches.append(
+                    f"{key}: {actual_value!r} != {expected_value!r}"
+                )
+        if mismatches:
+            raise ValueError(
+                "Resume checkpoint is incompatible with this run: "
+                + "; ".join(mismatches)
+            )
+
+    field.model.load_state_dict(
+        payload["deformation_mlp_state_dict"],
+        strict=True,
+    )
     if optimizer is not None and "optimizer_state_dict" in payload:
         optimizer.load_state_dict(payload["optimizer_state_dict"])
+    if optimizer is not None and "torch_rng_state" in payload:
+        torch.set_rng_state(payload["torch_rng_state"].cpu())
+    if (
+        optimizer is not None
+        and torch.cuda.is_available()
+        and payload.get("cuda_rng_state_all")
+    ):
+        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
     return int(payload["iteration"])
 
 
@@ -468,15 +559,16 @@ def train_medgs4d(
     config: MedGS4DConfig,
     *,
     resume: bool = False,
+    resume_checkpoint: Path | None = None,
     final_evaluation: bool = True,
 ) -> Path:
     """Train or resume one complete phase-conditioned MedGS4D run."""
 
     set_deterministic_seed(config.training.seed)
-    save_config(config, run_paths.config)
     phase_slice_index = pd.read_csv(study.phase_slice_manifest_path)[
         ["PhasePercent", "SliceIndex", "SliceCoordinate"]
     ]
+
     if resume:
         split_manifest = pd.read_csv(run_paths.split_manifest)
     else:
@@ -487,16 +579,6 @@ def train_medgs4d(
             validation_phases=config.split.validation_phases,
         )
         save_split_manifest(split_manifest, run_paths.split_manifest)
-    train_rows = get_split_rows(split_manifest, "train")
-    plan = load_or_create_sampling_plan(
-        run_paths.sampling_plan,
-        train_rows,
-        iterations=config.training.iterations,
-        seed=config.training.seed,
-        canonical_phase=config.canonical_phase,
-        phase_jitter_initial_std=config.training.phase_jitter_initial_std,
-        resume=resume,
-    )
 
     field = DeformationField(
         canonical,
@@ -508,20 +590,89 @@ def train_medgs4d(
     run_paths.checkpoints.mkdir(parents=True, exist_ok=True)
     run_paths.evaluation.mkdir(parents=True, exist_ok=True)
     run_paths.visualizations.mkdir(parents=True, exist_ok=True)
-    write_json(run_paths.root / "deformation_normalization.json", field.normalization_dict())
+    write_json(
+        run_paths.root / "deformation_normalization.json",
+        field.normalization_dict(),
+    )
 
     if resume:
-        checkpoint_path = find_latest_checkpoint(run_paths.checkpoints)
-        if checkpoint_path is None:
-            raise FileNotFoundError("No checkpoint is available for resume")
-        start_iteration = load_checkpoint(
-            checkpoint_path, field, optimizer, device=str(field.xyz.device)
+        checkpoint_path = (
+            resume_checkpoint.resolve()
+            if resume_checkpoint is not None
+            else find_latest_checkpoint(run_paths.checkpoints)
         )
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"No checkpoint is available for resume: {checkpoint_path}"
+            )
+        start_iteration = load_checkpoint(
+            checkpoint_path,
+            field,
+            optimizer,
+            device=str(field.xyz.device),
+            config=config,
+        )
+        if config.training.iterations < start_iteration:
+            raise ValueError(
+                f"Requested target iteration {config.training.iterations} "
+                f"is earlier than resume checkpoint {start_iteration}"
+            )
+
         history = reconcile_training_history(
-            load_training_history(run_paths.training_history), start_iteration
+            load_training_history(run_paths.training_history),
+            start_iteration,
         )
         validation_history = reconcile_training_history(
-            load_training_history(run_paths.validation_history), start_iteration
+            load_training_history(run_paths.validation_history),
+            start_iteration,
+        )
+
+        evaluation_history_path = run_paths.evaluation / "history.csv"
+        evaluation_history = load_training_history(evaluation_history_path)
+        if not evaluation_history.empty:
+            iteration_column = (
+                "CheckpointIteration"
+                if "CheckpointIteration" in evaluation_history.columns
+                else "Iteration"
+            )
+            evaluation_history = (
+                evaluation_history.loc[
+                    evaluation_history[iteration_column].astype(int)
+                    <= start_iteration
+                ]
+                .sort_values(iteration_column)
+                .drop_duplicates(iteration_column, keep="last")
+                .reset_index(drop=True)
+            )
+            write_dataframe(evaluation_history_path, evaluation_history)
+
+        # Make default future resume follow the explicitly selected branch.
+        save_checkpoint(
+            run_paths.checkpoints / "deformation_latest.pth",
+            iteration=start_iteration,
+            field=field,
+            optimizer=optimizer,
+            config=config,
+        )
+
+        stale_outputs = (
+            run_paths.completion,
+            run_paths.report,
+            run_paths.report_metrics,
+            run_paths.root / "training_history.pdf",
+            run_paths.evaluation / "per_slice.csv",
+            run_paths.evaluation / "per_phase.csv",
+            run_paths.evaluation / "overall.json",
+            run_paths.evaluation / "metrics.pdf",
+            run_paths.evaluation / "history.pdf",
+        )
+        for path in stale_outputs:
+            path.unlink(missing_ok=True)
+
+        print(
+            f"Resuming MedGS4D from iteration {start_iteration}: "
+            f"{checkpoint_path}",
+            flush=True,
         )
     else:
         start_iteration = 0
@@ -543,6 +694,20 @@ def train_medgs4d(
             config=config,
         )
 
+    save_config(config, run_paths.config)
+
+    train_rows = get_split_rows(split_manifest, "train")
+    plan = load_or_create_sampling_plan(
+        run_paths.sampling_plan,
+        train_rows,
+        iterations=config.training.iterations,
+        seed=config.training.seed,
+        canonical_phase=config.canonical_phase,
+        phase_jitter_initial_std=config.training.phase_jitter_initial_std,
+        resume=resume,
+        checkpoint_iteration=start_iteration,
+    )
+
     smoothness_np = (
         np.load(run_paths.smoothness_indices)
         if resume and run_paths.smoothness_indices.is_file()
@@ -555,7 +720,8 @@ def train_medgs4d(
     if not run_paths.smoothness_indices.is_file():
         np.save(run_paths.smoothness_indices, smoothness_np)
     smoothness_indices = torch.from_numpy(smoothness_np).to(
-        device=field.xyz.device, dtype=torch.long
+        device=field.xyz.device,
+        dtype=torch.long,
     )
     validation_rows = _validation_rows(
         split_manifest,
@@ -575,7 +741,10 @@ def train_medgs4d(
     segment_start = time.perf_counter()
     field.model.train()
 
-    for iteration in range(start_iteration + 1, config.training.iterations + 1):
+    for iteration in range(
+        start_iteration + 1,
+        config.training.iterations + 1,
+    ):
         sample = plan.iloc[iteration - 1].to_dict()
         metrics = train_step(
             canonical,
@@ -593,7 +762,9 @@ def train_medgs4d(
                 "Iteration": iteration,
                 "PhasePercent": float(sample["PhasePercent"]),
                 "SliceIndex": int(sample["SliceIndex"]),
-                "NeighborPhasePercent": float(sample["NeighborPhasePercent"]),
+                "NeighborPhasePercent": float(
+                    sample["NeighborPhasePercent"]
+                ),
                 "PhaseJitterStd": float(sample["PhaseJitterStd"]),
                 "PhaseJitter": float(sample["PhaseJitter"]),
                 "LearningRate": float(optimizer.param_groups[0]["lr"]),
@@ -613,12 +784,21 @@ def train_medgs4d(
             and not validation_rows.empty
         ):
             result = validate_during_training(
-                canonical, field, study, validation_rows, config
+                canonical,
+                field,
+                study,
+                validation_rows,
+                config,
             )
             if result is not None:
-                validation_rows_history.append({"Iteration": iteration, **result})
+                validation_rows_history.append(
+                    {"Iteration": iteration, **result}
+                )
 
-        if iteration % config.training.log_every == 0 or iteration == config.training.iterations:
+        if (
+            iteration % config.training.log_every == 0
+            or iteration == config.training.iterations
+        ):
             current = pd.DataFrame(history_rows)
             write_dataframe(run_paths.training_history, current)
             if validation_rows_history:
@@ -628,15 +808,22 @@ def train_medgs4d(
                 )
             window = current.tail(config.training.log_every)
             print(
-                f"Iteration {iteration:06d}/{config.training.iterations:06d} "
+                f"Iteration {iteration:06d}/"
+                f"{config.training.iterations:06d} "
                 f"L1={window['L1'].mean():.6f} "
                 f"SSIM={window['SSIM'].mean():.6f} "
                 f"PSNR={window['PSNR'].mean():.3f}",
                 flush=True,
             )
 
-        if iteration % config.training.checkpoint_every == 0 or iteration == config.training.iterations:
-            checkpoint = run_paths.checkpoints / f"deformation_iter_{iteration:06d}.pth"
+        if (
+            iteration % config.training.checkpoint_every == 0
+            or iteration == config.training.iterations
+        ):
+            checkpoint = (
+                run_paths.checkpoints
+                / f"deformation_iter_{iteration:06d}.pth"
+            )
             save_checkpoint(
                 checkpoint,
                 iteration=iteration,
@@ -655,9 +842,18 @@ def train_medgs4d(
     history = pd.DataFrame(history_rows)
     write_dataframe(run_paths.training_history, history)
     if validation_rows_history:
-        write_dataframe(run_paths.validation_history, pd.DataFrame(validation_rows_history))
+        write_dataframe(
+            run_paths.validation_history,
+            pd.DataFrame(validation_rows_history),
+        )
     summary = _training_summary(history)
     write_dataframe(run_paths.training_summary, summary)
+
+    elapsed_seconds = (
+        float(history.iloc[-1]["ElapsedSeconds"])
+        if not history.empty
+        else 0.0
+    )
     write_json(
         run_paths.completion,
         {
@@ -665,10 +861,20 @@ def train_medgs4d(
             "iteration": config.training.iterations,
             "parameter_count": field.parameter_count,
             "training_samples": len(train_rows),
-            "validation_samples": int((split_manifest["Split"] == "validation").sum()),
-            "elapsed_seconds": float(history.iloc[-1]["ElapsedSeconds"]),
+            "validation_samples": int(
+                (split_manifest["Split"] == "validation").sum()
+            ),
+            "elapsed_seconds": elapsed_seconds,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": (
+                config.canonical_checkpoint_iteration
+            ),
         },
     )
+
+    from .reporting import generate_training_history_pdf
+
+    generate_training_history_pdf(run_paths.root)
 
     if final_evaluation:
         from .evaluation import (
@@ -693,6 +899,10 @@ def train_medgs4d(
             run_paths.checkpoints / "deformation_latest.pth"
         )
         overall["CheckpointIteration"] = config.training.iterations
+        overall["CanonicalCheckpoint"] = config.canonical_checkpoint
+        overall["CanonicalCheckpointIteration"] = (
+            config.canonical_checkpoint_iteration
+        )
         save_evaluation_results(
             run_paths.evaluation,
             per_slice=per_slice,
@@ -701,3 +911,4 @@ def train_medgs4d(
         )
         generate_run_report(run_paths.root)
     return run_paths.root
+

@@ -596,6 +596,230 @@ def aggregate_metrics_overall(per_slice: pd.DataFrame) -> dict[str, Any]:
     }
 
 
+
+def _dynamic_evaluation_history_row(
+    overall: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Flatten headline noncanonical metrics for one dynamic checkpoint."""
+
+    metrics = overall.get("AllNoncanonical", {})
+    return {
+        "CheckpointIteration": int(overall["CheckpointIteration"]),
+        "CanonicalCheckpointIteration": int(
+            overall.get("CanonicalCheckpointIteration", 0)
+        ),
+        "BaselineL1": float(metrics.get("BaselineL1", np.nan)),
+        "DynamicL1": float(metrics.get("DynamicL1", np.nan)),
+        "L1Reduction": float(metrics.get("L1Reduction", np.nan)),
+        "BaselinePSNR": float(metrics.get("BaselinePSNR", np.nan)),
+        "DynamicPSNR": float(metrics.get("DynamicPSNR", np.nan)),
+        "PSNRGain": float(metrics.get("PSNRGain", np.nan)),
+        "BaselineSSIM": float(metrics.get("BaselineSSIM", np.nan)),
+        "DynamicSSIM": float(metrics.get("DynamicSSIM", np.nan)),
+        "SSIMGain": float(metrics.get("SSIMGain", np.nan)),
+    }
+
+
+def update_dynamic_evaluation_history(
+    evaluation_dir: Path,
+    overall: Mapping[str, Any],
+) -> pd.DataFrame:
+    """Upsert one full MedGS4D evaluation point by checkpoint iteration."""
+
+    path = evaluation_dir / "history.csv"
+    history = _load_csv_or_empty(path)
+    row = pd.DataFrame([_dynamic_evaluation_history_row(overall)])
+    history = (
+        pd.concat([history, row], ignore_index=True)
+        .sort_values("CheckpointIteration")
+        .drop_duplicates("CheckpointIteration", keep="last")
+        .reset_index(drop=True)
+    )
+    write_dataframe(path, history)
+    return history
+
+
+def save_dynamic_evaluation_metrics_pdf(
+    per_phase: pd.DataFrame,
+    output_path: Path,
+    *,
+    checkpoint_iteration: int,
+    canonical_checkpoint_iteration: int,
+) -> Path:
+    """Save publication-ready final dynamic metrics by respiratory phase."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    metric_specs = (
+        (
+            "BaselinePSNR",
+            "DynamicPSNR",
+            "PSNRGain",
+            "PSNR [dB]",
+            "PSNR gain [dB]",
+        ),
+        (
+            "BaselineSSIM",
+            "DynamicSSIM",
+            "SSIMGain",
+            "SSIM",
+            "SSIM gain",
+        ),
+        (
+            "BaselineL1",
+            "DynamicL1",
+            "L1Reduction",
+            "L1 error",
+            "L1 reduction",
+        ),
+    )
+    ordered = per_phase.sort_values(["Split", "PhasePercent"])
+    rc = {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+    with plt.rc_context(rc), PdfPages(output_path) as pdf:
+        for baseline, dynamic, gain, ylabel, gain_label in metric_specs:
+            figure, axes = plt.subplots(
+                2,
+                1,
+                figsize=(7.2, 6.6),
+                sharex=True,
+                constrained_layout=True,
+            )
+            for split, frame in ordered.groupby("Split", sort=False):
+                axes[0].plot(
+                    frame["PhasePercent"],
+                    frame[baseline],
+                    marker="o",
+                    linestyle="--",
+                    label=f"{split}: baseline",
+                )
+                axes[0].plot(
+                    frame["PhasePercent"],
+                    frame[dynamic],
+                    marker="o",
+                    label=f"{split}: dynamic",
+                )
+                axes[1].plot(
+                    frame["PhasePercent"],
+                    frame[gain],
+                    marker="o",
+                    label=split,
+                )
+            axes[0].set_ylabel(ylabel)
+            axes[0].set_title(f"Final reconstruction: {ylabel}")
+            axes[0].grid(True, linewidth=0.5, alpha=0.3)
+            axes[0].legend(frameon=False)
+            axes[1].axhline(0.0, linewidth=0.8)
+            axes[1].set_xlabel("Respiratory phase [%]")
+            axes[1].set_ylabel(gain_label)
+            axes[1].grid(True, linewidth=0.5, alpha=0.3)
+            axes[1].legend(frameon=False)
+            figure.text(
+                0.01,
+                0.01,
+                (
+                    f"Dynamic checkpoint {checkpoint_iteration} | "
+                    f"canonical checkpoint {canonical_checkpoint_iteration}"
+                ),
+                fontsize=8,
+            )
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
+    return output_path
+
+
+def save_dynamic_evaluation_history_pdf(
+    history: pd.DataFrame,
+    output_path: Path,
+) -> Path:
+    """Plot full-evaluation metrics across completed dynamic checkpoints."""
+
+    metric_specs = (
+        (
+            "BaselinePSNR",
+            "DynamicPSNR",
+            "PSNRGain",
+            "Mean PSNR [dB]",
+            "PSNR gain [dB]",
+        ),
+        (
+            "BaselineSSIM",
+            "DynamicSSIM",
+            "SSIMGain",
+            "Mean SSIM",
+            "SSIM gain",
+        ),
+        (
+            "BaselineL1",
+            "DynamicL1",
+            "L1Reduction",
+            "Mean L1",
+            "L1 reduction",
+        ),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = history.sort_values("CheckpointIteration")
+    rc = {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+    with plt.rc_context(rc), PdfPages(output_path) as pdf:
+        for baseline, dynamic, gain, ylabel, gain_label in metric_specs:
+            figure, axes = plt.subplots(
+                2,
+                1,
+                figsize=(7.2, 6.6),
+                sharex=True,
+                constrained_layout=True,
+            )
+            axes[0].plot(
+                ordered["CheckpointIteration"],
+                ordered[baseline],
+                marker="o",
+                linestyle="--",
+                label="baseline",
+            )
+            axes[0].plot(
+                ordered["CheckpointIteration"],
+                ordered[dynamic],
+                marker="o",
+                label="dynamic",
+            )
+            axes[0].set_ylabel(ylabel)
+            axes[0].set_title(f"Full evaluation history: {ylabel}")
+            axes[0].grid(True, linewidth=0.5, alpha=0.3)
+            axes[0].legend(frameon=False)
+
+            axes[1].plot(
+                ordered["CheckpointIteration"],
+                ordered[gain],
+                marker="o",
+                label=gain,
+            )
+            axes[1].axhline(0.0, linewidth=0.8)
+            axes[1].set_xlabel("Dynamic checkpoint iteration")
+            axes[1].set_ylabel(gain_label)
+            axes[1].xaxis.set_major_locator(MaxNLocator(integer=True))
+            axes[1].grid(True, linewidth=0.5, alpha=0.3)
+            axes[1].legend(frameon=False)
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
+    return output_path
+
+
 def save_evaluation_results(
     evaluation_dir: Path,
     *,
@@ -604,13 +828,33 @@ def save_evaluation_results(
     overall: Mapping[str, Any],
     prefix: str = "",
 ) -> None:
-    """Save per-slice, per-phase, and overall evaluation outputs."""
+    """Save final metrics and maintain full-evaluation checkpoint history."""
 
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     stem = f"{prefix}_" if prefix else ""
     write_dataframe(evaluation_dir / f"{stem}per_slice.csv", per_slice)
     write_dataframe(evaluation_dir / f"{stem}per_phase.csv", per_phase)
     write_json(evaluation_dir / f"{stem}overall.json", overall)
+
+    if not prefix and "CheckpointIteration" in overall:
+        checkpoint_iteration = int(overall["CheckpointIteration"])
+        canonical_iteration = int(
+            overall.get("CanonicalCheckpointIteration", 0)
+        )
+        history = update_dynamic_evaluation_history(
+            evaluation_dir,
+            overall,
+        )
+        save_dynamic_evaluation_metrics_pdf(
+            per_phase,
+            evaluation_dir / "metrics.pdf",
+            checkpoint_iteration=checkpoint_iteration,
+            canonical_checkpoint_iteration=canonical_iteration,
+        )
+        save_dynamic_evaluation_history_pdf(
+            history,
+            evaluation_dir / "history.pdf",
+        )
 
 
 def evaluate_run(
@@ -629,6 +873,11 @@ def evaluate_run(
     canonical = load_frozen_canonical(
         Path(config.canonical_model_dir),
         Path(config.medgs_repository),
+        checkpoint=(
+            Path(config.canonical_checkpoint)
+            if config.canonical_checkpoint
+            else None
+        ),
         device=device,
     )
     field = DeformationField(
@@ -640,7 +889,12 @@ def evaluate_run(
     checkpoint_path = checkpoint or find_latest_checkpoint(run_dir / "checkpoints")
     if checkpoint_path is None:
         raise FileNotFoundError(f"No checkpoint found under {run_dir / 'checkpoints'}")
-    load_checkpoint(checkpoint_path, field, device=device)
+    load_checkpoint(
+        checkpoint_path,
+        field,
+        device=device,
+        config=config,
+    )
     split_manifest = pd.read_csv(run_dir / "split_manifest.csv")
 
     prefix = "" if split == "all" else split
@@ -659,7 +913,15 @@ def evaluate_run(
     overall = aggregate_metrics_overall(per_slice)
     overall["Checkpoint"] = str(checkpoint_path)
     overall["CheckpointIteration"] = int(
-        torch.load(checkpoint_path, map_location="cpu", weights_only=False)["iteration"]
+        torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=False,
+        )["iteration"]
+    )
+    overall["CanonicalCheckpoint"] = config.canonical_checkpoint
+    overall["CanonicalCheckpointIteration"] = (
+        config.canonical_checkpoint_iteration
     )
     save_evaluation_results(
         run_dir / "evaluation",

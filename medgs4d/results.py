@@ -60,6 +60,9 @@ def list_runs(
                     "RunName": config.run_name,
                     "SplitMode": config.split.mode,
                     "Iterations": config.training.iterations,
+                    "CanonicalCheckpointIteration": (
+                        config.canonical_checkpoint_iteration
+                    ),
                     "Checkpoint": str(checkpoint) if checkpoint else "",
                     "Complete": (run_dir / "completion.json").is_file(),
                     "Evaluated": (run_dir / "evaluation" / "overall.json").is_file(),
@@ -145,6 +148,11 @@ def load_run_models(
     canonical = load_frozen_canonical(
         Path(run.config.canonical_model_dir),
         Path(run.config.medgs_repository),
+        checkpoint=(
+            Path(run.config.canonical_checkpoint)
+            if run.config.canonical_checkpoint
+            else None
+        ),
         device=device,
     )
     field = DeformationField(
@@ -156,7 +164,12 @@ def load_run_models(
     checkpoint_path = checkpoint or run.checkpoint
     if checkpoint_path is None:
         raise FileNotFoundError(f"No checkpoint found in {run.run_dir}")
-    load_checkpoint(checkpoint_path, field, device=device)
+    load_checkpoint(
+        checkpoint_path,
+        field,
+        device=device,
+        config=run.config,
+    )
     field.model.eval()
     return canonical, field
 
@@ -174,6 +187,11 @@ def print_run_summary(run: RunResults) -> None:
     print(f"Study:           {config.study_name}")
     print(f"Run:             {config.run_name}")
     print(f"Canonical phase: {config.canonical_phase:g}%")
+    print(
+        "Canonical ckpt:  "
+        f"{config.canonical_checkpoint_iteration} "
+        f"({config.canonical_checkpoint or 'run default'})"
+    )
     print(f"Split:           {config.split.mode}")
     print(f"Samples:         {split_counts}")
     print(f"Progress:        {final_iteration:,}/{config.training.iterations:,}")

@@ -46,6 +46,132 @@ def build_report_metrics(per_slice: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def generate_training_history_pdf(
+    run_dir: Path,
+    output_path: Path | None = None,
+) -> Path:
+    """Generate a publication-ready PDF of dynamic training histories."""
+
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+
+    run_dir = run_dir.resolve()
+    output_path = output_path or run_dir / "training_history.pdf"
+    history = pd.read_csv(run_dir / "training_history.csv")
+    validation_path = run_dir / "validation_history.csv"
+    validation = (
+        pd.read_csv(validation_path)
+        if validation_path.is_file()
+        else pd.DataFrame()
+    )
+    config = load_medgs4d_config(run_dir / "config.json")
+
+    rolling_window = min(50, max(1, len(history)))
+    rc = {
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+    }
+
+    with plt.rc_context(rc), PdfPages(output_path) as pdf:
+        figure, axes = plt.subplots(
+            1,
+            3,
+            figsize=(10.5, 3.6),
+            constrained_layout=True,
+        )
+        for axis, metric in zip(axes, ("L1", "PSNR", "SSIM")):
+            rolling = (
+                history.set_index("Iteration")[metric]
+                .rolling(rolling_window, min_periods=1)
+                .mean()
+            )
+            axis.plot(
+                rolling.index,
+                rolling.values,
+                label=f"train (rolling {rolling_window})",
+            )
+            if not validation.empty and metric in validation.columns:
+                axis.plot(
+                    validation["Iteration"],
+                    validation[metric],
+                    marker="o",
+                    label="validation",
+                )
+            axis.set_xlabel("Iteration")
+            axis.set_title(metric if metric != "PSNR" else "PSNR [dB]")
+            axis.grid(True, linewidth=0.5, alpha=0.3)
+            axis.legend(frameon=False)
+        figure.suptitle(
+            "MedGS4D reconstruction metrics during training",
+            fontsize=12,
+        )
+        figure.text(
+            0.01,
+            0.01,
+            (
+                f"{config.study_name} | {config.run_name} | "
+                f"canonical checkpoint "
+                f"{config.canonical_checkpoint_iteration}"
+            ),
+            fontsize=8,
+        )
+        pdf.savefig(figure, bbox_inches="tight")
+        plt.close(figure)
+
+        pages = (
+            (
+                ("TotalLoss", "Total loss"),
+                ("ImageLoss", "Image loss"),
+            ),
+            (
+                (
+                    "DeformationMagnitudeLoss",
+                    "Deformation magnitude loss",
+                ),
+                (
+                    "TemporalSmoothnessLoss",
+                    "Temporal smoothness loss",
+                ),
+            ),
+            (
+                ("GradientNorm", "Gradient norm"),
+                ("PeakGpuMemoryGB", "Peak GPU memory [GB]"),
+            ),
+        )
+        for specs in pages:
+            figure, axes = plt.subplots(
+                1,
+                2,
+                figsize=(7.8, 3.6),
+                constrained_layout=True,
+            )
+            for axis, (column, title) in zip(axes, specs):
+                if column not in history.columns:
+                    axis.axis("off")
+                    continue
+                rolling = (
+                    history.set_index("Iteration")[column]
+                    .rolling(rolling_window, min_periods=1)
+                    .mean()
+                )
+                axis.plot(rolling.index, rolling.values)
+                axis.set_xlabel("Iteration")
+                axis.set_ylabel(title)
+                axis.set_title(title)
+                axis.grid(True, linewidth=0.5, alpha=0.3)
+            pdf.savefig(figure, bbox_inches="tight")
+            plt.close(figure)
+
+    return output_path
+
+
 def generate_run_report(run_dir: Path, output_path: Path | None = None) -> Path:
     """Generate a minimal publication-ready PDF from saved run artifacts."""
 
@@ -89,7 +215,10 @@ def generate_run_report(run_dir: Path, output_path: Path | None = None) -> Path:
             f"Study: {config.study_name}    Run: {config.run_name}\n"
             f"Canonical phase: {config.canonical_phase:g}%    Split: {split_text}\n"
             f"Iterations: {config.training.iterations:,}    "
-            f"MLP: {config.deformation.hidden_layers} × {config.deformation.hidden_dim}    "
+            f"Canonical checkpoint: "
+            f"{config.canonical_checkpoint_iteration:,}\n"
+            f"MLP: {config.deformation.hidden_layers} × "
+            f"{config.deformation.hidden_dim}    "
             f"Seed: {config.training.seed}",
             fontsize=9,
             va="top",

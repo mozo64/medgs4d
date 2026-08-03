@@ -117,12 +117,23 @@ def assert_resume_compatible(
     saved_config: MedGS4DConfig,
     requested_config: MedGS4DConfig,
 ) -> None:
-    """Reject resume when the saved and requested run configurations differ."""
+    """Reject resume changes except for the requested target iteration."""
 
-    if config_to_dict(saved_config) != config_to_dict(requested_config):
+    saved = config_to_dict(saved_config)
+    requested = config_to_dict(requested_config)
+
+    saved_iterations = int(saved["training"].pop("iterations"))
+    requested_iterations = int(requested["training"].pop("iterations"))
+
+    if saved != requested:
         raise ValueError(
-            "Requested configuration differs from the saved run configuration."
+            "Requested configuration differs from the saved run configuration. "
+            "Only training.iterations may change during resume."
         )
+    if requested_iterations <= 0:
+        raise ValueError("Requested training iterations must be positive")
+    if requested_iterations == saved_iterations:
+        return
 
 
 def find_latest_checkpoint(checkpoints_dir: Path) -> Path | None:
