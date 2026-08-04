@@ -1,11 +1,12 @@
 # MedGS4D Technical Guide
 
-MedGS4D builds a phase-conditioned deformation model on top of a frozen canonical MedGS reconstruction of 4D-CT data. The repository now supports two related workflows:
+MedGS4D builds a phase-conditioned deformation model on top of a frozen canonical MedGS reconstruction of 4D-CT data. The repository supports three connected workflows:
 
 1. **Image reconstruction:** prepare respiratory CT volumes, train a static canonical MedGS model, train a dynamic deformation MLP, and evaluate reconstructed slices across respiratory phases.
-2. **Reference geometry:** convert phase-specific RTSTRUCT contours into voxel masks and watertight meshes that can later serve as ground truth for 4D mesh reconstruction.
+2. **Reference geometry:** convert phase-specific RTSTRUCT contours into voxel masks and watertight meshes used as geometric ground truth.
+3. **Gaussian-to-mesh baseline:** map MedGS latent coordinates to DICOM patient coordinates, transfer learned Gaussian motion to a fixed-topology canonical tumor mesh, and evaluate predicted meshes against phase-specific RTSTRUCT references.
 
-The two workflows share the same DICOM study, patient-coordinate geometry, and respiratory phase convention, but they currently remain separate. The RTSTRUCT meshes are deterministic reference artifacts; they are not yet predicted by MedGS4D.
+All workflows use the same DICOM study, respiratory phase convention, and patient-coordinate geometry. RTSTRUCT meshes remain deterministic reference artifacts. Predicted meshes are obtained by deforming the phase-0 reference mesh with a training-free, robust interpolation of the learned MedGS4D Gaussian motion.
 
 The upstream MedGS repository remains external and is passed explicitly with `--medgs-repo`.
 
@@ -21,15 +22,20 @@ The repository currently provides:
 - checkpoint comparison, error maps, and deformation diagnostics,
 - RTSTRUCT inventory and ROI geometry inspection,
 - batch construction of reference masks and watertight meshes for all respiratory phases,
-- notebook inspection of image reconstructions and reference mesh artifacts.
+- validated MedGS latent-to-DICOM coordinate transforms,
+- Gaussian-neighborhood analysis around a canonical tumor mesh,
+- robust transfer of Gaussian displacement to fixed-topology mesh vertices,
+- Dice, IoU, surface-distance, HD95, centroid, volume, watertightness, and degeneracy evaluation,
+- compact saved predictions and phase-comparison PNGs,
+- notebook inspection of RTSTRUCT geometry, Gaussian alignment, image reconstruction, and Gaussian-to-mesh results.
 
-Not implemented yet:
+Current limitations:
 
-- a fixed-topology canonical tumor mesh,
-- vertex correspondence between independently generated phase meshes,
-- transfer of the learned Gaussian deformation field to mesh vertices,
-- prediction of tumor meshes from MedGS4D,
-- surface-distance evaluation of predicted meshes against RTSTRUCT-derived reference meshes.
+- the Gaussian-to-mesh transfer is heuristic and has no geometry-supervised training,
+- nearby Gaussians are selected geometrically, not semantically as tumor Gaussians,
+- the worked result covers one patient and one study,
+- direct transfer improves centroid tracking but does not yet recover reliable tumor shape or volume,
+- independently generated RTSTRUCT reference meshes do not have vertex correspondence across phases.
 
 ## 2. Repository structure
 
@@ -42,7 +48,9 @@ medgs4d/
 │   ├── deformation.py
 │   ├── diagnostics.py
 │   ├── evaluation.py
+│   ├── gaussian_geometry.py
 │   ├── mesh_series.py
+│   ├── mesh_transfer.py
 │   ├── mesh_validation.py
 │   ├── meshes.py
 │   ├── reporting.py
@@ -61,13 +69,18 @@ medgs4d/
 │   ├── evaluate_checkpoints.py
 │   ├── diagnose_deformation.py
 │   ├── export_error_maps.py
+│   ├── inspect_gaussian_geometry.py
+│   ├── predict_mesh_from_gaussians.py
 │   ├── rtstruct_mesh.py
 │   ├── visualize_medgs4d.py
 │   └── run_patient117_20001024_medgs4d.sh
 ├── notebooks/
+│   ├── 04_validate_rtstruct_mesh.ipynb
 │   └── results_browser.ipynb
 ├── tests/
+│   ├── test_gaussian_geometry.py
 │   ├── test_mesh_series.py
+│   ├── test_mesh_transfer.py
 │   ├── test_rtstruct_mesh.py
 │   ├── test_rtstruct_roi_inspection.py
 │   └── other unit and integration tests
@@ -75,7 +88,7 @@ medgs4d/
 └── README.md
 ```
 
-The Python package contains reusable logic. The scripts are intentionally thin CLI entry points. Notebook code should load already prepared artifacts rather than reimplement DICOM parsing, rasterization, training, or evaluation.
+The Python package contains reusable logic. The scripts are intentionally thin CLI entry points. Notebook code loads prepared artifacts rather than reimplementing DICOM parsing, rasterization, training, coordinate mapping, mesh transfer, or evaluation.
 
 ## 3. Environment and installation
 
@@ -102,7 +115,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 Basic checks:
 
 ```bash
-$PYTHON -m compileall -q medgs4d scripts
+$PYTHON -m compileall -q medgs4d scripts tests
 $PYTHON -m pytest -q -m "not worf"
 ```
 
@@ -112,6 +125,8 @@ Inspect any command before running it:
 $PYTHON scripts/data.py --help
 $PYTHON scripts/train_medgs4d.py --help
 $PYTHON scripts/rtstruct_mesh.py --help
+$PYTHON scripts/inspect_gaussian_geometry.py --help
+$PYTHON scripts/predict_mesh_from_gaussians.py --help
 ```
 
 ## 4. Worked study and shared paths
@@ -992,13 +1007,279 @@ RTSTRUCT mask → mesh → mask on the same voxel grid
 
 `Dice = 1.0` means the generated mesh reproduces the source voxel mask exactly under the implemented rasterization. It does not prove that the clinical contour is correct, that MedGS4D predicts the tumor, or that meshes from different phases have vertex correspondence.
 
-Each phase mesh was generated independently by marching cubes. Vertex count and indexing therefore vary between phases. The current output is a sequence of valid reference surfaces, not yet a fixed-topology 4-D mesh.
+Each phase reference mesh was generated independently by marching cubes. Vertex count and indexing therefore vary between phases, so the reference sequence itself has no vertex correspondence. The Gaussian-to-mesh workflow instead preserves correspondence by deforming the phase-0 mesh while keeping its faces fixed.
 
-## 10. Notebook workflows
+## 10. MedGS-to-DICOM geometry and Gaussian-to-mesh transfer
+
+The geometry workflow connects the learned MedGS4D deformation field with the RTSTRUCT tumor meshes. It has two stages:
+
+```text
+Stage A: MedGS latent coordinates ↔ DICOM patient coordinates
+Stage B: Gaussian displacement → fixed-topology tumor mesh
+```
+
+No additional network is trained in either stage.
+
+### 10.1 Coordinate semantics
+
+For Gaussian \(i\), let the canonical latent center be:
+
+$$\mathbf{c}_i^0=(x_i^0,z_i^0,m_i^0).$$
+
+For respiratory phase \(p\), the dynamic model produces a phase-dependent latent center \(\mathbf{c}_i(p)\). In this representation:
+
+- \(x\) and \(z\) are coordinates on the MedGS image plane,
+- \(m\) is continuous renderer time and therefore continuous position in the CT slice stack,
+- the upstream canonical camera maps \((x,z)\) to image row and column,
+- cumulative MedGS time steps map \(m\) to a continuous slice index,
+- DICOM volume geometry maps \((\text{slice},\text{row},\text{column})\) to patient coordinates in millimetres.
+
+Let \(T\) denote the complete latent-to-patient transform. The patient-space displacement of Gaussian \(i\) at phase \(p\) is:
+
+$$\mathbf{d}_i(p)=T\!\left(\mathbf{c}_i(p)\right)-T\!\left(\mathbf{c}_i^0\right).$$
+
+Inspect the transform and Gaussian coverage:
+
+```bash
+GEOMETRY_DIR="$RUN_DIR/evaluation/gaussian_geometry/iter_007000"
+FINAL_DYNAMIC_CHECKPOINT="$RUN_DIR/checkpoints/deformation_iter_007000.pth"
+
+$PYTHON scripts/inspect_gaussian_geometry.py \
+  --run-dir "$RUN_DIR" \
+  --mesh-series-dir "$SERIES_DIR" \
+  --checkpoint "$FINAL_DYNAMIC_CHECKPOINT" \
+  --knn-k 16 \
+  --device cuda
+```
+
+Main outputs:
+
+```text
+evaluation/gaussian_geometry/iter_007000/
+├── summary.json
+├── deformation_in_patient_mm.csv
+├── mesh_vertex_knn.csv
+├── mesh_vertex_knn_indices.npy
+├── mesh_vertex_knn_distances_mm.npy
+├── canonical_gaussian_sample.npz
+├── tumor_neighborhood_gaussian_indices.npy
+├── projection_overlay.png
+└── tumor_neighborhood_overview.png
+```
+
+For the worked study:
+
+- `611,563` canonical Gaussians were loaded,
+- `99.20%` mapped inside the CT volume,
+- mesh patient-coordinate round-trip error was `0 mm`,
+- the nearest Gaussian was on average `2.01 mm` from a mesh vertex,
+- the median distance to the 16th neighbor was `4.52 mm`,
+- `1,092` unique Gaussians occurred in the tumor-vertex neighborhoods.
+
+These checks validate the coordinate mapping and local geometric coverage. They do not prove that a nearby Gaussian represents tumor tissue.
+
+### 10.2 Notation for robust transfer
+
+Let $\mathbf{v}_j^0$ be vertex $j$ of the canonical phase-0 tumor mesh. Stage A stores the \(K\) nearest canonical Gaussians:
+
+$$\mathcal{N}_j=\operatorname{KNN}_K(\mathbf{v}_j^0).$$
+
+Let $o_i$ denote Gaussian opacity. The opacity confidence used during transfer is:
+
+$$\omega_i=\max(o_i,\varepsilon)^q.$$
+
+The notation $\operatorname{wmed}$ below means a component-wise weighted median of 3-D displacement vectors. It is robust to large individual displacement outliers, but it is not a learned estimator and is not rotation-invariant.
+
+The symbols used in the equations are mapped to CLI and saved configuration names in Section 10.4.
+
+### 10.3 Robust Gaussian-to-mesh transfer
+
+#### Global coherent motion
+
+The algorithm first estimates one dominant displacement for the entire Gaussian neighborhood of the tumor. An opacity-weighted component-wise median gives the initial center:
+
+$$\mathbf{m}_G(p)=\operatorname{wmed}\!\left(\{\mathbf{d}_i(p)\},\{\omega_i\}\right).$$
+
+For every tumor-neighborhood Gaussian, define its residual magnitude:
+
+$$r_i(p)=\left\|\mathbf{d}_i(p)-\mathbf{m}_G(p)\right\|_2.$$
+
+Let the median residual and median absolute deviation be:
+
+$$\widetilde{r}(p)=\operatorname{median}_i r_i(p).$$
+
+$$s_G(p)=\operatorname{median}_i\left|r_i(p)-\widetilde{r}(p)\right|.$$
+
+The robust residual threshold is:
+
+$$\theta_G(p)=\widetilde{r}(p)+\tau\max\!\left(1.4826\,s_G(p),\varepsilon\right).$$
+
+The initial global inlier set is:
+
+$$\mathcal{I}_G(p)=\{i:r_i(p)\leq\theta_G(p)\}.$$
+
+If this set contains fewer than \(\lceil\rho N\rceil\) of the \(N\) tumor-neighborhood Gaussians, the Gaussians with the smallest residuals are retained until the minimum is reached.
+
+The global tumor translation is then:
+
+$$\mathbf{t}(p)=\operatorname{wmed}\!\left(\{\mathbf{d}_i(p):i\in\mathcal{I}_G(p)\},\{\omega_i:i\in\mathcal{I}_G(p)\}\right).$$
+
+#### Local motion of one mesh vertex
+
+For Gaussian $i\in\mathcal{N}_j$, let $\delta_{ji}$ be its canonical patient-space distance to vertex \(j\). The local distance scale is:
+
+$$h_j=\operatorname{median}_{i\in\mathcal{N}_j}\delta_{ji}.$$
+
+The spatial weight is:
+
+$$a_{ji}=\exp\!\left[-\frac{1}{2}\left(\frac{\delta_{ji}}{h_j}\right)^2\right].$$
+
+The combined distance-and-opacity weight is:
+
+$$w_{ji}=a_{ji}\omega_i.$$
+
+For local outlier detection, the component-wise median displacement is:
+
+$$\mathbf{m}_j(p)=\operatorname{median}_{i\in\mathcal{N}_j}\mathbf{d}_i(p).$$
+
+Define local residuals and their MAD:
+
+$$r_{ji}(p)=\left\|\mathbf{d}_i(p)-\mathbf{m}_j(p)\right\|_2.$$
+
+$$\widetilde{r}_j(p)=\operatorname{median}_{i\in\mathcal{N}_j}r_{ji}(p).$$
+
+$$s_j(p)=\operatorname{median}_{i\in\mathcal{N}_j}\left|r_{ji}(p)-\widetilde{r}_j(p)\right|.$$
+
+The local threshold is:
+
+$$\theta_j(p)=\widetilde{r}_j(p)+\tau\max\!\left(1.4826\,s_j(p),\varepsilon\right).$$
+
+The local inlier set combines the local threshold with the global coherent-motion mask:
+
+$$\mathcal{I}_j(p)=\{i\in\mathcal{N}_j\cap\mathcal{I}_G(p):r_{ji}(p)\leq\theta_j(p)\}.$$
+
+If fewer than $L$ neighbors remain, the implementation retains the best candidates according to local residual plus canonical vertex-to-Gaussian distance.
+
+The robust local displacement of vertex $j$ is:
+
+$$\mathbf{u}^{\mathrm{local}}_j(p)=\operatorname{wmed}\!\left(\{\mathbf{d}_i(p):i\in\mathcal{I}_j(p)\},\{w_{ji}:i\in\mathcal{I}_j(p)\}\right).$$
+
+#### Global-local combination
+
+The initial displacement of vertex \(j\) is a convex combination of the global tumor translation and the local estimate:
+
+$$\mathbf{u}_j^{(0)}(p)=(1-\lambda)\mathbf{t}(p)+\lambda\mathbf{u}^{\mathrm{local}}_j(p).$$
+
+For the worked run, \(\lambda=0.25\). The estimate therefore uses 75% global translation and 25% local displacement.
+
+This form was introduced after a direct local weighted-mean baseline produced very large and unstable surface deformations. A purely global translation is stable but cannot change tumor shape. The global-local form is a robust training-free compromise, not a learned anatomical motion model.
+
+#### Mesh-graph smoothing
+
+Let \(\mathcal{A}_j\) be the one-ring mesh neighbors of vertex \(j\). For smoothing pass \(s\):
+
+$$\mathbf{u}_j^{(s+1)}(p)=(1-\alpha)\mathbf{u}_j^{(s)}(p)+\frac{\alpha}{|\mathcal{A}_j|}\sum_{k\in\mathcal{A}_j}\mathbf{u}_k^{(s)}(p).$$
+
+After each pass, the original mean displacement is restored. Smoothing therefore reduces local variation without changing the average tumor translation. After \(S\) passes, denote the smoothed displacement by \(\widetilde{\mathbf{u}}_j(p)\).
+
+#### Final displacement bound
+
+Each smoothed displacement is finally bounded by \(U_{\max}\):
+
+$$\mathbf{u}_j(p)=\widetilde{\mathbf{u}}_j(p)\min\!\left(1,\frac{U_{\max}}{\max(\|\widetilde{\mathbf{u}}_j(p)\|_2,\varepsilon)}\right).$$
+
+The predicted phase mesh is:
+
+$$\widehat{\mathbf{v}}_j(p)=\mathbf{v}_j^0+\mathbf{u}_j(p).$$
+
+Faces remain unchanged. All predicted phases therefore have the same topology and direct vertex correspondence.
+
+### 10.4 Symbols and implementation parameters
+
+| Symbol | CLI option | Saved key | Worked value | Meaning |
+|---|---|---|---:|---|
+| \(K\) | `--knn-k` in Stage A | `KnnK` | `16` | Canonical Gaussian neighbors stored per mesh vertex. |
+| \(\tau\) | `--robust-z` | `robust_z` | `3.5` | Width of the global and local median/MAD thresholds. |
+| \(\rho\) | `--global-minimum-fraction` | `global_minimum_fraction` | `0.25` | Minimum fraction of tumor-neighborhood Gaussians retained for the global estimate. |
+| \(L\) | `--min-inliers` | `minimum_inliers` | `4` | Minimum retained Gaussian neighbors for one vertex. |
+| \(q\) | `--opacity-power` | `opacity_power` | `1.0` | Exponent applied to opacity confidence. |
+| \(\lambda\) | `--local-detail-weight` | `local_detail_weight` | `0.25` | Contribution of the local estimate in the global-local combination. |
+| \(S\) | `--smoothing-iterations` | `smoothing_iterations` | `8` | Number of mesh-graph smoothing passes. |
+| \(\alpha\) | `--smoothing-alpha` | `smoothing_alpha` | `0.35` | Neighbor contribution in one smoothing pass. |
+| \(U_{\max}\) | `--max-displacement-mm` | `maximum_displacement_mm` | `20.0 mm` | Final hard bound on vertex displacement magnitude. |
+| — | `--surface-samples` | `surface_samples` | `20000` | Surface samples used for distance metrics; does not affect prediction. |
+| — | `--seed` | `seed` | `42` | Reproducible surface sampling during evaluation. |
+| \(\varepsilon\) | fixed internally | — | small positive tolerance | Prevents division by zero and zero robust scale. |
+
+### 10.5 Run transfer and evaluation
+
+```bash
+$PYTHON scripts/predict_mesh_from_gaussians.py \
+  --run-dir "$RUN_DIR" \
+  --mesh-series-dir "$SERIES_DIR" \
+  --checkpoint "$FINAL_DYNAMIC_CHECKPOINT" \
+  --geometry-dir "$GEOMETRY_DIR" \
+  --surface-samples 20000 \
+  --device cuda \
+  --save-ply \
+  --force
+```
+
+Default output:
+
+```text
+evaluation/mesh_transfer/iter_007000/
+├── per_phase.csv
+├── summary.json
+├── predictions.npz
+├── metrics.png
+├── comparisons/
+│   ├── phase_00.png
+│   ├── phase_10.png
+│   └── ...
+└── meshes/
+    ├── phase_00.ply
+    ├── phase_10.ply
+    └── ...
+```
+
+| Artifact | Meaning |
+|---|---|
+| `per_phase.csv` | Baseline, transferred, and improvement metrics for every respiratory phase. |
+| `summary.json` | Configuration plus aggregates for all noncanonical, training, validation, and canonical splits. |
+| `predictions.npz` | All predicted vertices, vertex displacements, phases, and common faces in one compact file. |
+| `metrics.png` | Dice, HD95, centroid error, and transferred motion across phases. |
+| `comparisons/phase_XX.png` | Canonical, RTSTRUCT reference, and Gaussian-transferred meshes. |
+| `meshes/phase_XX.ply` | Optional predicted PLY meshes enabled by `--save-ply`. |
+
+The canonical phase is checked as an invariant:
+
+```text
+vertex displacement = 0
+Dice = 1
+HD95 = 0 mm
+centroid error = 0 mm
+```
+
+### 10.6 Worked result
+
+The static mesh baseline reuses the phase-0 RTSTRUCT mesh without deformation. The transferred mesh uses the algorithm above. Phase 0 is excluded from noncanonical averages because it is exact by construction.
+
+| Split | Phases | Dice static → transferred | HD95 [mm] static → transferred | Centroid error [mm] static → transferred | Signed volume error [%] static → transferred |
+|---|---:|---:|---:|---:|---:|
+| All noncanonical | 9 | `0.658 → 0.524` | `5.07 → 8.82` | `4.78 → 3.56` | `-6.4 → -38.9` |
+| Training | 4 | `0.629 → 0.470` | `5.24 → 10.04` | `5.06 → 3.72` | `-4.7 → -44.7` |
+| Holdout | 5 | `0.682 → 0.568` | `4.94 → 7.84` | `4.56 → 3.43` | `-7.8 → -34.2` |
+
+The same pattern appears on training and holdout phases: the learned Gaussian field contains useful information about global tumor translation, but direct local interpolation degrades overlap, boundary accuracy, and volume preservation.
+
+At the image-reconstruction level, MedGS4D improved mean noncanonical SSIM from `0.563` to `0.625` and reduced L1 from `0.1689` to `0.1671`; mean PSNR changed from `11.13 dB` to `11.09 dB`. Better image-space SSIM therefore did not automatically produce a reliable geometry-space deformation.
+
+## 11. Notebook workflows
 
 Use the repository's environment-backed kernel so that the editable package and its dependencies match the CLI.
 
-### 10.1 Load a dynamic run
+### 11.1 Load a dynamic run
 
 **What:** inspect completed metrics and training histories without manually reading every CSV.
 
@@ -1028,7 +1309,7 @@ run = load_run(run_dir=RUN_DIR)
 display(run.training_history.tail(20))
 ```
 
-### 10.2 Browse reconstructed slices and breathing phases
+### 11.2 Browse reconstructed slices and breathing phases
 
 ```python
 from medgs4d.visualization import (
@@ -1052,7 +1333,7 @@ The error browser adds baseline and dynamic absolute errors plus their local red
 
 Avoid loading a second full model in the notebook on the same GPU while training unless sufficient VRAM is available.
 
-### 10.3 Load the RTSTRUCT reference series
+### 11.3 Load the RTSTRUCT reference series
 
 **What:** load one validated phase through the same artifact contract used by the CLI.
 
@@ -1092,9 +1373,31 @@ Body, lung, and bone surfaces are visualization aids derived from simple HU thre
 
 A round-trip XOR panel is useful only when masks differ. When `RoundtripDice = 1.0`, the XOR is empty and should be reported as no mismatch rather than displaying an arbitrary empty slice.
 
-## 11. CLI reference
+### 11.4 Demonstration notebook
 
-### 11.1 `scripts/data.py`
+`notebooks/04_validate_rtstruct_mesh.ipynb` is the end-to-end demonstration notebook for the reference geometry and Gaussian-to-mesh experiment.
+
+It is organized so that the reader first sees the RTSTRUCT data without any predicted mesh:
+
+- phase-0 axial and orthogonal CT views with the RTSTRUCT tumor,
+- phase-specific RTSTRUCT reference meshes,
+- CT-derived body, lung, and bone context.
+
+The later sections introduce the Gaussian workflow:
+
+- MedGS-to-DICOM projection overlays,
+- Gaussian neighborhoods around the canonical tumor,
+- image-reconstruction summaries for the canonical and dynamic models,
+- all/train/holdout mesh-transfer metrics,
+- phase sliders for RTSTRUCT and Gaussian-transferred contours,
+- 3-D anatomy with reference and transferred tumor meshes,
+- compact run and transfer configuration tables.
+
+The notebook derives run paths from `SERIES_DIR` when exactly one evaluated transfer result is available. It reads saved PNG, CSV, JSON, and NPZ artifacts and does not rerun training or full evaluation.
+
+## 12. CLI reference
+
+### 12.1 `scripts/data.py`
 
 | Subcommand | Required and notable parameters |
 |---|---|
@@ -1106,7 +1409,7 @@ A round-trip XOR panel is useful only when masks differ. When `RoundtripDice = 1
 | `inspect` | `--dicom-dir`, `--patient-id`, `--study-uid`. |
 | `prepare` | `--dicom-dir`, `--prepared-root`, `--patient-id`, `--study-uid`, `--study-name`; optional `--hu-window`, `--denoise-sigma`, `--force`. |
 
-### 11.2 `scripts/train_canonical.py`
+### 12.2 `scripts/train_canonical.py`
 
 | Parameter | Default | Meaning |
 |---|---:|---|
@@ -1125,7 +1428,7 @@ A round-trip XOR panel is useful only when masks differ. When `RoundtripDice = 1
 | `--resume` | off | Continue the newest checkpoint. |
 | `--force` | off | Delete and recreate the selected run. |
 
-### 11.3 `scripts/train_medgs4d.py`
+### 12.3 `scripts/train_medgs4d.py`
 
 | Parameter | Default | Meaning |
 |---|---:|---|
@@ -1171,7 +1474,7 @@ smoothness_weight    = 1e-3
 
 These values are saved in `config.json` but are not currently CLI flags.
 
-### 11.4 Evaluation and diagnostics
+### 12.4 Evaluation and diagnostics
 
 ```text
 evaluate_canonical.py:
@@ -1219,7 +1522,7 @@ visualize_medgs4d.py:
   --device
 ```
 
-### 11.5 `scripts/rtstruct_mesh.py`
+### 12.5 `scripts/rtstruct_mesh.py`
 
 | Subcommand | Parameters and purpose |
 |---|---|
@@ -1238,7 +1541,42 @@ Common build parameters:
 | `--ct-vis-stride Z Y X` | `2 4 4` | Downsampling stride for `ct_vis_hu.npy`. |
 | `--force` | off | Replace the selected output directory. |
 
-## 12. Reproducibility, overwrite, and runtime rules
+### 12.6 `scripts/inspect_gaussian_geometry.py`
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `--run-dir` | required | Completed dynamic MedGS4D run. |
+| `--mesh-series-dir` | required | RTSTRUCT reference mesh series. |
+| `--checkpoint` | run default | Exact dynamic deformation checkpoint. |
+| `--knn-k` | `16` | Gaussian neighbors stored per canonical mesh vertex. |
+| `--device` | `cuda` | Torch device. |
+
+The command validates latent-to-DICOM geometry, exports Gaussian coverage summaries, stores KNN neighborhoods, and writes projection and 3-D overview PNGs.
+
+### 12.7 `scripts/predict_mesh_from_gaussians.py`
+
+| Parameter | Default | Meaning |
+|---|---:|---|
+| `--run-dir` | required | Completed dynamic MedGS4D run. |
+| `--mesh-series-dir` | required | RTSTRUCT reference mesh series. |
+| `--checkpoint` | run default | Dynamic checkpoint used to predict Gaussian motion. |
+| `--geometry-dir` | inferred | Stage-A geometry and KNN artifacts. |
+| `--output-dir` | inferred | Mesh-transfer evaluation directory. |
+| `--phases` | all study phases | Optional selected phase list. |
+| `--robust-z` | `3.5` | Median/MAD inlier threshold width. |
+| `--min-inliers` | `4` | Minimum local neighbors retained per vertex. |
+| `--global-minimum-fraction` | `0.25` | Minimum Gaussian fraction for global translation. |
+| `--opacity-power` | `1.0` | Opacity-confidence exponent. |
+| `--local-detail-weight` | `0.25` | Local-motion contribution around global translation. |
+| `--smoothing-iterations` | `8` | Mesh displacement smoothing passes. |
+| `--smoothing-alpha` | `0.35` | Neighbor contribution per smoothing pass. |
+| `--max-displacement-mm` | `20.0` | Final displacement magnitude bound. |
+| `--surface-samples` | `20000` | Surface samples for distance metrics. |
+| `--seed` | `42` | Reproducible evaluation sampling. |
+| `--save-ply` | off | Save one predicted PLY per phase. |
+| `--force` | off | Replace the selected output directory. |
+
+## 13. Reproducibility, overwrite, and runtime rules
 
 - `--force` is destructive for the selected output directory. Prefer a new run name for a new experiment.
 - Canonical and dynamic configurations persist checkpoint identity and resolved paths. Evaluation should load those saved identities instead of silently choosing newer files.
@@ -1249,15 +1587,18 @@ Common build parameters:
 - Notebook visualization should read generated artifacts rather than perform data preparation or training.
 - Avoid simultaneous full model copies on the same GPU unless VRAM headroom is known.
 
-## 13. Next development steps
+## 14. Improvement ideas
 
-The reference data and image reconstruction pipelines are now prepared for the actual 4-D mesh experiment. The planned sequence is:
+The current Gaussian-to-mesh result is a technically validated, training-free baseline. The main limitation is semantic: Euclidean proximity to the tumor mesh does not guarantee that a Gaussian represents tumor tissue. The following directions are more promising than further manual tuning on the worked study:
 
-1. analyze the ten reference meshes: volume, area, centroid, bounding box, and surface distances across phase,
-2. select a canonical phase and construct a fixed-topology mesh sequence with vertex correspondence,
-3. derive the transform between DICOM patient coordinates and MedGS model coordinates,
-4. interpolate the learned Gaussian deformation field at canonical mesh vertices,
-5. compare predicted phase meshes against RTSTRUCT-derived reference masks and surfaces,
-6. report Dice/IoU after rasterization, average surface distance, Chamfer distance, HD95, volume error, centroid error, motion amplitude, and temporal smoothness.
+- **Geometry-supervised residual correction:** keep the robust Gaussian transfer as an initial estimate and learn only a small vertex-displacement correction from RTSTRUCT masks, signed-distance fields, or reference surfaces.
+- **Semantic Gaussian selection:** estimate which Gaussians belong to the tumor or its boundary and exclude nearby Gaussians representing vessels, bronchi, lung parenchyma, or unrelated intensity edges.
+- **Rigid or affine tumor motion before nonrigid deformation:** estimate translation, rotation, and optionally anisotropic scale at the tumor level, then predict only the remaining local deformation.
+- **Volume-aware objectives:** penalize implausible shrinkage or expansion and regularize phase-to-phase tumor volume trajectories.
+- **Surface-aware regularization:** replace or supplement post-hoc smoothing with Laplacian, edge-length, normal-consistency, or as-rigid-as-possible losses during learning.
+- **Joint image and geometry supervision:** retain CT reconstruction losses while adding Dice, signed-distance, surface-distance, centroid, or landmark losses.
+- **Temporal and cyclic consistency:** regularize vertex trajectories across neighboring respiratory phases and enforce continuity between the final and initial phase.
+- **Geometry-space model selection:** select dynamic checkpoints using held-out mesh metrics rather than image metrics alone.
+- **Multi-study validation:** repeat the experiment across patients, tumor sizes, locations, and respiratory motion amplitudes.
 
-The nearest step does not require new training: first establish the reference motion and a classical fixed-topology baseline. Existing MedGS4D checkpoints can then be tested before deciding whether mesh-aware retraining or an additional segmentation component is necessary.
+Further tuning of clipping, smoothing, or interpolation weights on this single study would risk fitting the heuristic to one example. The strongest next step is geometry-aware supervision evaluated on held-out phases and additional patients.
