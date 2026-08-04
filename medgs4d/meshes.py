@@ -171,6 +171,13 @@ def mesh_to_mask_roundtrip(
             segment_yx = _triangle_plane_segment(triangle, plane_z)
             if segment_yx is None:
                 continue
+            # Adjacent triangles should yield identical intersection endpoints,
+            # but patient-to-voxel transforms introduce tiny floating-point
+            # differences. Quantization closes those contours before polygonize.
+            segment_yx = np.round(segment_yx, decimals=6)
+            if np.linalg.norm(segment_yx[0] - segment_yx[1]) < 1e-8:
+                continue
+
             # Shapely coordinates are x, y; triangle coordinates are y, x.
             lines.append(
                 LineString(
