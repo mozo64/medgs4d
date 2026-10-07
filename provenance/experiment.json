@@ -1,0 +1,61 @@
+{
+  "canonical_iterations": 15000,
+  "data_root": "/home/jovyan/shared/mtm_medgs_stack/data/uvi_net/4D-Lung-Preprocessed",
+  "error_vmax": 0.2,
+  "evaluation_phases": [
+    10,
+    20,
+    30,
+    40
+  ],
+  "gpu_index": "1",
+  "method_source_sha256": "70ac0d68631b034e1e7046f8a0d3ff33fa414dde7abd2b617dda2506deb876b7",
+  "methods": [
+    "baseline",
+    "linear_pseudo",
+    "cycle_v2",
+    "trajectory",
+    "consistent_cycle",
+    "trajectory_cycle"
+  ],
+  "new_options": {
+    "alignment_weight": 0.01,
+    "correction_weight": 0.001,
+    "curvature_step": 0.025,
+    "curvature_weight": 1e-05,
+    "endpoint_image_weight": 0.05,
+    "endpoint_warmup": 1000,
+    "geometry_gaussians": 8192,
+    "joint_ramp": 1000,
+    "path_weight": 0.005,
+    "roundtrip_weight": 0.01,
+    "transport_pretrain": 500
+  },
+  "qualitative_cases": [
+    "118_0",
+    "119_1",
+    "119_7"
+  ],
+  "qualitative_slice": 64,
+  "root": "/home/jovyan/shared/mtm_medgs_stack/experiments/medgs4d_six_methods_20261001",
+  "seed": 42,
+  "source_manifest_sha256": "b58d1475cad5dcf681d3b91f0454ff0321a0afc26bf196df25755c18c20d9882",
+  "temporal_iterations": 7000,
+  "test_cases": [
+    "118_0",
+    "118_1",
+    "118_2",
+    "118_3",
+    "118_4",
+    "118_5",
+    "119_0",
+    "119_1",
+    "119_2",
+    "119_3",
+    "119_4",
+    "119_5",
+    "119_6",
+    "119_7"
+  ],
+  "worker_source_sha256": "fde582c86b7016aec562ef50716902fbeae7db48bee516f8545ffab4e344cce5"
+}

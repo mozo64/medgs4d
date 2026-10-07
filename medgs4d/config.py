@@ -46,6 +46,16 @@ class TrainingConfig:
     ssim_weight: float = 0.25
     magnitude_weight: float = 1e-4
     smoothness_weight: float = 1e-3
+    pseudo_weight: float = 0.0
+    cycle_weight: float = 0.0
+    pairwise_cycle_weight: float = 0.0
+    pairwise_agreement_weight: float = 0.0
+    pairwise_transport_weight: float = 0.0
+    pairwise_cycle_warmup_iterations: int = 1000
+    pairwise_cycle_ramp_iterations: int = 1000
+    pairwise_hidden_dim: int = 128
+    pairwise_hidden_layers: int = 3
+    pairwise_time_frequencies: int = 2
     phase_jitter_initial_std: float = 0.0
 
 
@@ -164,6 +174,26 @@ def validate_medgs4d_config(config: MedGS4DConfig) -> None:
         raise ValueError("smoothness_gaussians must be positive")
     if training.phase_jitter_initial_std < 0:
         raise ValueError("phase jitter standard deviation cannot be negative")
+    if training.pairwise_cycle_weight < 0:
+        raise ValueError("pairwise_cycle_weight must be non-negative")
+    if training.pairwise_agreement_weight < 0:
+        raise ValueError("pairwise_agreement_weight must be non-negative")
+    if training.pairwise_transport_weight < 0:
+        raise ValueError("pairwise_transport_weight must be non-negative")
+    if training.pairwise_cycle_warmup_iterations < 0:
+        raise ValueError("pairwise cycle warmup must be non-negative")
+    if training.pairwise_cycle_ramp_iterations < 0:
+        raise ValueError("pairwise cycle ramp must be non-negative")
+    if training.pairwise_hidden_dim <= 0:
+        raise ValueError("pairwise_hidden_dim must be positive")
+    if training.pairwise_hidden_layers <= 0:
+        raise ValueError("pairwise_hidden_layers must be positive")
+    if training.pairwise_time_frequencies <= 0:
+        raise ValueError("pairwise_time_frequencies must be positive")
+    if training.cycle_weight < 0:
+        raise ValueError("cycle_weight must be non-negative")
+    if training.pseudo_weight < 0:
+        raise ValueError("pseudo_weight cannot be negative")
     if config.canonical_checkpoint_iteration < 0:
         raise ValueError("canonical checkpoint iteration cannot be negative")
 

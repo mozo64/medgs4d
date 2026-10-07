@@ -1,0 +1,10 @@
+opencv-python
+tqdm
+matplotlib
+trimesh
+torch 
+torchvision
+plyfile
+nibabel
+open3d
+scikit-image
