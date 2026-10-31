@@ -1,0 +1,1722 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+import math
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.checkpoint import checkpoint
+
+from scene.canonical import CanonicalAssets, get_camera_for_slice
+from models.transport import (
+    PairwiseTransport,
+    build_pairwise_cycle,
+    state_to_view,
+)
+from arguments.temporal import MedGS4DConfig, save_config
+from scene.volume_data import StudyManifest, load_target_tensor
+from models.deformation import DeformationField, PhaseDeformedGaussianView
+from utils.run_utils import RunPaths, find_latest_checkpoint, write_dataframe, write_json
+from scene.temporal_splits import create_split_manifest, get_split_rows, save_split_manifest
+
+
+@dataclass
+class TrainingState:
+    """Store the current iteration and persisted training histories."""
+
+    iteration: int
+    history: pd.DataFrame
+    validation_history: pd.DataFrame
+
+
+def set_deterministic_seed(seed: int) -> None:
+    """Seed Python-independent numerical generators used by the training code."""
+
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _phase_neighbors(phase: float, phase_grid: list[float]) -> tuple[float, float]:
+    ordered = sorted(float(value) for value in phase_grid)
+    index = ordered.index(float(phase))
+    return ordered[(index - 1) % len(ordered)], ordered[(index + 1) % len(ordered)]
+
+
+def build_sampling_plan(
+    train_rows: pd.DataFrame,
+    *,
+    iterations: int,
+    seed: int,
+    canonical_phase: float | None = None,
+    phase_jitter_initial_std: float = 0.0,
+) -> pd.DataFrame:
+    """Create a deterministic balanced phase-and-slice sampling sequence."""
+
+    if train_rows.empty:
+        raise ValueError("Training split is empty")
+    rng = np.random.default_rng(seed)
+    noise_rng = np.random.default_rng(seed + 1000)
+    phases = sorted(train_rows["PhasePercent"].astype(float).unique())
+    phase_grid = sorted(
+        set(phases + ([] if canonical_phase is None else [float(canonical_phase)]))
+    )
+    rows_by_phase = {
+        phase: train_rows.loc[
+            np.isclose(train_rows["PhasePercent"].astype(float), phase)
+        ].reset_index(drop=True)
+        for phase in phases
+    }
+    phase_order: list[float] = []
+    while len(phase_order) < iterations:
+        phase_order.extend(rng.permutation(phases).tolist())
+    phase_order = phase_order[:iterations]
+
+    shuffled_indices: dict[float, list[int]] = {}
+    positions = {phase: 0 for phase in phases}
+    records = []
+    for iteration, phase in enumerate(phase_order, start=1):
+        if phase not in shuffled_indices or positions[phase] >= len(shuffled_indices[phase]):
+            shuffled_indices[phase] = rng.permutation(len(rows_by_phase[phase])).tolist()
+            positions[phase] = 0
+        row_index = shuffled_indices[phase][positions[phase]]
+        positions[phase] += 1
+        row = rows_by_phase[phase].iloc[row_index]
+
+        left, right = _phase_neighbors(phase, phase_grid)
+        neighbor = left if int(rng.integers(0, 2)) == 0 else right
+        progress = (iteration - 1) / max(iterations - 1, 1)
+        jitter_std = phase_jitter_initial_std * (1.0 - progress)
+        jitter = (
+            float(noise_rng.normal(0.0, jitter_std)) if jitter_std > 0 else 0.0
+        )
+        respiratory_time = phase / 100.0
+        augmented_time = float(np.remainder(respiratory_time + jitter, 1.0))
+        records.append(
+            {
+                "Iteration": iteration,
+                "PhasePercent": phase,
+                "SliceIndex": int(row["SliceIndex"]),
+                "NeighborPhasePercent": neighbor,
+                "RespiratoryTime": respiratory_time,
+                "PhaseJitterStd": jitter_std,
+                "PhaseJitter": jitter,
+                "AugmentedRespiratoryTime": augmented_time,
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def build_smoothness_indices(
+    gaussian_count: int,
+    *,
+    sample_size: int,
+    seed: int,
+) -> np.ndarray:
+    """Select a fixed reproducible Gaussian subset for smoothness regularization."""
+
+    rng = np.random.default_rng(seed)
+    count = min(int(sample_size), int(gaussian_count))
+    return np.sort(rng.choice(gaussian_count, size=count, replace=False).astype(np.int64))
+
+
+def load_or_create_sampling_plan(
+    path: Path,
+    train_rows: pd.DataFrame,
+    *,
+    iterations: int,
+    seed: int,
+    canonical_phase: float,
+    phase_jitter_initial_std: float,
+    resume: bool,
+    checkpoint_iteration: int = 0,
+) -> pd.DataFrame:
+    """Create, reuse, trim, or deterministically extend a sampling plan."""
+
+    if not resume:
+        plan = build_sampling_plan(
+            train_rows,
+            iterations=iterations,
+            seed=seed,
+            canonical_phase=canonical_phase,
+            phase_jitter_initial_std=phase_jitter_initial_std,
+        )
+        write_dataframe(path, plan)
+        return plan
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Saved sampling plan does not exist: {path}")
+
+    plan = pd.read_csv(path)
+    if len(plan) < checkpoint_iteration:
+        raise ValueError(
+            f"Sampling plan has {len(plan)} rows but checkpoint is at "
+            f"iteration {checkpoint_iteration}"
+        )
+    if iterations < checkpoint_iteration:
+        raise ValueError(
+            f"Requested target iteration {iterations} is earlier than "
+            f"resume checkpoint {checkpoint_iteration}"
+        )
+
+    plan = (
+        plan.sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
+    )
+
+    if len(plan) > iterations:
+        plan = plan.iloc[:iterations].copy()
+
+    if len(plan) < iterations:
+        existing_count = len(plan)
+        additional_count = iterations - existing_count
+        continuing_jitter_std = (
+            float(plan.iloc[-1]["PhaseJitterStd"])
+            if existing_count and "PhaseJitterStd" in plan
+            else phase_jitter_initial_std
+        )
+        extension = build_sampling_plan(
+            train_rows,
+            iterations=additional_count,
+            seed=seed + existing_count + 1,
+            canonical_phase=canonical_phase,
+            phase_jitter_initial_std=continuing_jitter_std,
+        )
+        extension = extension.copy()
+        extension["Iteration"] = np.arange(
+            existing_count + 1,
+            iterations + 1,
+            dtype=np.int64,
+        )
+        plan = pd.concat([plan, extension], ignore_index=True)
+
+    write_dataframe(path, plan)
+    return plan
+
+
+def create_optimizer(
+    field: DeformationField,
+    learning_rate: float,
+    *,
+    pairwise_cycle: PairwiseTransport | None = None,
+) -> torch.optim.Optimizer:
+    """Create the optimizer for primary and optional pairwise deformation models."""
+
+    parameters = list(
+        field.model.parameters()
+    )
+
+    if pairwise_cycle is not None:
+        parameters.extend(
+            pairwise_cycle.parameters()
+        )
+
+    return torch.optim.Adam(
+        parameters,
+        lr=learning_rate,
+    )
+
+
+def compute_reconstruction_loss(
+    canonical: CanonicalAssets,
+    rendered: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    l1_weight: float,
+    ssim_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute weighted L1 and SSIM reconstruction loss components."""
+
+    rendered_batch = rendered.unsqueeze(0) if rendered.ndim == 3 else rendered
+    target_batch = target.unsqueeze(0) if target.ndim == 3 else target
+    l1_value = canonical.runtime.l1_loss(rendered_batch, target_batch)
+    ssim_value = canonical.runtime.ssim(rendered_batch, target_batch)
+    image_loss = l1_weight * l1_value + ssim_weight * (1.0 - ssim_value)
+    mse = torch.mean((rendered_batch - target_batch) ** 2)
+    psnr = -10.0 * torch.log10(mse.clamp_min(1e-12))
+    return image_loss, {"l1": l1_value, "ssim": ssim_value, "psnr": psnr}
+
+
+def normalized_deformation(
+    field: DeformationField,
+    state: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Express x, z, and effective m displacement in normalized units."""
+
+    return torch.cat(
+        [
+            state["delta_xz"] / field.xz_scale,
+            state["delta_m"] / field.m_scale,
+        ],
+        dim=-1,
+    )
+
+
+def compute_magnitude_loss(
+    field: DeformationField,
+    state: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Penalize excessive displacement from canonical Gaussian geometry."""
+
+    return normalized_deformation(field, state).square().mean()
+
+
+def compute_temporal_smoothness_loss(
+    field: DeformationField,
+    first_state: Mapping[str, torch.Tensor],
+    second_state: Mapping[str, torch.Tensor],
+) -> torch.Tensor:
+    """Penalize abrupt deformation changes between neighboring phases."""
+
+    first = normalized_deformation(field, first_state)
+    second = normalized_deformation(field, second_state)
+    return (first - second).square().mean()
+
+
+def compute_pseudo_supervision_loss(
+    field: DeformationField,
+    endpoint_state: Mapping[str, torch.Tensor],
+    gaussian_indices: torch.Tensor,
+    *,
+    endpoint_time: float,
+    alpha: float,
+) -> tuple[torch.Tensor, float]:
+    """Constrain an intermediate deformation toward the scaled endpoint deformation."""
+
+    canonical_time = field.canonical_phase / 100.0
+    pseudo_time = canonical_time + alpha * (
+        endpoint_time - canonical_time
+    )
+
+    pseudo_state = field.build_subset_state(
+        pseudo_time,
+        gaussian_indices,
+    )
+
+    target = (
+        alpha
+        * normalized_deformation(
+            field,
+            endpoint_state,
+        ).detach()
+    )
+
+    prediction = normalized_deformation(
+        field,
+        pseudo_state,
+    )
+
+    loss = (prediction - target).square().mean()
+
+    return loss, pseudo_time
+
+
+
+def build_pairwise_phase_view(
+    field: DeformationField,
+    source_state: Mapping[str, torch.Tensor],
+    *,
+    source_time: float,
+    target_time: float,
+) -> PhaseDeformedGaussianView:
+    """Transport a dynamic Gaussian state between two respiratory times."""
+
+    source_xz = (
+        field.xz
+        + source_state["delta_xz"]
+    )
+
+    source_m_logits = (
+        field.m_logits
+        + source_state["delta_m_logit"]
+    )
+
+    source_m = torch.sigmoid(
+        source_m_logits
+    )
+
+    normalized_coordinates = torch.cat(
+        [
+            (
+                source_xz
+                - field.xz_mean
+            )
+            / field.xz_scale,
+            (
+                source_m
+                - field.m_mean
+            )
+            / field.m_scale,
+        ],
+        dim=-1,
+    )
+
+    spatial_features = (
+        field.encode_spatial_coordinates(
+            normalized_coordinates
+        )
+    )
+
+    chunks = []
+
+    for start in range(
+        0,
+        spatial_features.shape[0],
+        field.config.chunk_size,
+    ):
+        selected = spatial_features[
+            start:
+            start + field.config.chunk_size
+        ]
+
+        target_inputs = (
+            field.build_mlp_inputs(
+                selected,
+                target_time,
+            )
+        )
+
+        source_inputs = (
+            field.build_mlp_inputs(
+                selected,
+                source_time,
+            )
+        )
+
+        joint_inputs = torch.cat(
+            [
+                target_inputs,
+                source_inputs,
+            ],
+            dim=0,
+        )
+
+        outputs = checkpoint(
+            field.model,
+            joint_inputs,
+            use_reentrant=False,
+        )
+
+        count = selected.shape[0]
+
+        chunks.append(
+            outputs[:count]
+            - outputs[count:]
+        )
+
+    pairwise_delta = torch.cat(
+        chunks,
+        dim=0,
+    )
+
+    target_xz = (
+        source_xz
+        + pairwise_delta[:, :2]
+    )
+
+    target_m_logits = (
+        source_m_logits
+        + pairwise_delta[:, 2:3]
+    )
+
+    target_m = torch.sigmoid(
+        target_m_logits
+    )
+
+    target_xyz = torch.stack(
+        [
+            target_xz[:, 0],
+            field.xyz[:, 1],
+            target_xz[:, 1],
+        ],
+        dim=-1,
+    )
+
+    return PhaseDeformedGaussianView(
+        field.canonical.gaussians,
+        target_xyz,
+        target_m,
+    )
+
+
+def compute_cyclic_reconstruction_loss(
+    canonical: CanonicalAssets,
+    field: DeformationField,
+    study: StudyManifest,
+    camera,
+    endpoint_target: torch.Tensor,
+    source_state: Mapping[str, torch.Tensor],
+    *,
+    source_time: float,
+    endpoint_phase: float,
+    slice_index: int,
+    config: MedGS4DConfig,
+    iteration: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Reconstruct both observed endpoints from one intermediate state."""
+
+    canonical_time = (
+        field.canonical_phase / 100.0
+    )
+
+    endpoint_time = (
+        endpoint_phase / 100.0
+    )
+
+    canonical_view = (
+        build_pairwise_phase_view(
+            field,
+            source_state,
+            source_time=source_time,
+            target_time=canonical_time,
+        )
+    )
+
+    endpoint_view = (
+        build_pairwise_phase_view(
+            field,
+            source_state,
+            source_time=source_time,
+            target_time=endpoint_time,
+        )
+    )
+
+    canonical_render = (
+        canonical.runtime.render(
+            camera,
+            canonical_view,
+            canonical.pipeline,
+            canonical.background,
+            train=True,
+            iter=iteration,
+        )["render"]
+    )
+
+    endpoint_render = (
+        canonical.runtime.render(
+            camera,
+            endpoint_view,
+            canonical.pipeline,
+            canonical.background,
+            train=True,
+            iter=iteration,
+        )["render"]
+    )
+
+    canonical_target = load_target_tensor(
+        study,
+        field.canonical_phase,
+        slice_index,
+        representation=(
+            config.target_representation
+        ),
+        device=str(field.xyz.device),
+    )
+
+    canonical_loss, _ = (
+        compute_reconstruction_loss(
+            canonical,
+            canonical_render,
+            canonical_target,
+            l1_weight=(
+                config.training.l1_weight
+            ),
+            ssim_weight=(
+                config.training.ssim_weight
+            ),
+        )
+    )
+
+    endpoint_loss, _ = (
+        compute_reconstruction_loss(
+            canonical,
+            endpoint_render,
+            endpoint_target,
+            l1_weight=(
+                config.training.l1_weight
+            ),
+            ssim_weight=(
+                config.training.ssim_weight
+            ),
+        )
+    )
+
+    cycle_loss = 0.5 * (
+        canonical_loss
+        + endpoint_loss
+    )
+
+    return (
+        cycle_loss,
+        canonical_loss,
+        endpoint_loss,
+    )
+
+
+
+
+def pairwise_cycle_schedule(
+    config: MedGS4DConfig,
+    iteration: int,
+) -> float:
+    """Return the warm-up and linear-ramp coefficient for cycle-v2."""
+
+    warmup = int(
+        config.training
+        .pairwise_cycle_warmup_iterations
+    )
+
+    ramp = int(
+        config.training
+        .pairwise_cycle_ramp_iterations
+    )
+
+    if iteration <= warmup:
+        return 0.0
+
+    if ramp == 0:
+        return 1.0
+
+    return float(
+        min(
+            1.0,
+            max(
+                0.0,
+                (
+                    iteration
+                    - warmup
+                )
+                / ramp,
+            ),
+        )
+    )
+
+
+def compute_pairwise_cycle_losses(
+    canonical: CanonicalAssets,
+    field: DeformationField,
+    pairwise_cycle: PairwiseTransport,
+    study: StudyManifest,
+    camera,
+    endpoint_target: torch.Tensor,
+    endpoint_state: Mapping[str, torch.Tensor],
+    *,
+    endpoint_phase: float,
+    endpoint_time: float,
+    slice_index: int,
+    config: MedGS4DConfig,
+    iteration: int,
+) -> dict[str, torch.Tensor | float]:
+    """Build one three-time cycle and reconstruct both observed endpoints."""
+
+    rng = np.random.default_rng(
+        config.training.seed
+        + 500_000
+        + int(iteration)
+    )
+
+    u1 = float(
+        rng.uniform(
+            -0.5,
+            0.0,
+        )
+    )
+
+    u2 = float(
+        rng.uniform(
+            0.0,
+            1.0,
+        )
+    )
+
+    u3 = float(
+        rng.uniform(
+            1.0,
+            1.5,
+        )
+    )
+
+    canonical_time = (
+        field.canonical_phase
+        / 100.0
+    )
+
+    middle_time = (
+        canonical_time
+        + u2
+        * (
+            endpoint_time
+            - canonical_time
+        )
+    )
+
+    _, middle_state = (
+        field.build_phase_state(
+            middle_time,
+            use_checkpointing=True,
+        )
+    )
+
+    cycle = build_pairwise_cycle(
+        pairwise_cycle,
+        endpoint_state=endpoint_state,
+        middle_state=middle_state,
+        u1=u1,
+        u2=u2,
+        u3=u3,
+    )
+
+    canonical_view = state_to_view(
+        field,
+        cycle.reconstructed_canonical,
+    )
+
+    endpoint_view = state_to_view(
+        field,
+        cycle.reconstructed_endpoint,
+    )
+
+    canonical_render = (
+        canonical.runtime.render(
+            camera,
+            canonical_view,
+            canonical.pipeline,
+            canonical.background,
+            train=True,
+            iter=iteration,
+        )["render"]
+    )
+
+    endpoint_render = (
+        canonical.runtime.render(
+            camera,
+            endpoint_view,
+            canonical.pipeline,
+            canonical.background,
+            train=True,
+            iter=iteration,
+        )["render"]
+    )
+
+    canonical_target = load_target_tensor(
+        study,
+        field.canonical_phase,
+        slice_index,
+        representation=(
+            config.target_representation
+        ),
+        device=str(field.xyz.device),
+    )
+
+    canonical_loss, _ = (
+        compute_reconstruction_loss(
+            canonical,
+            canonical_render,
+            canonical_target,
+            l1_weight=(
+                config.training.l1_weight
+            ),
+            ssim_weight=(
+                config.training.ssim_weight
+            ),
+        )
+    )
+
+    endpoint_loss, _ = (
+        compute_reconstruction_loss(
+            canonical,
+            endpoint_render,
+            endpoint_target,
+            l1_weight=(
+                config.training.l1_weight
+            ),
+            ssim_weight=(
+                config.training.ssim_weight
+            ),
+        )
+    )
+
+    cycle_image_loss = (
+        0.5
+        * (
+            canonical_loss
+            + endpoint_loss
+        )
+    )
+
+    return {
+        "cycle_image_loss": (
+            cycle_image_loss
+        ),
+        "canonical_loss": (
+            canonical_loss
+        ),
+        "endpoint_loss": (
+            endpoint_loss
+        ),
+        "agreement_loss": (
+            cycle.agreement_loss
+        ),
+        "transport_loss": (
+            cycle.transport_loss
+        ),
+        "u1": u1,
+        "u2": u2,
+        "u3": u3,
+        "middle_time": middle_time,
+    }
+
+
+
+def train_step(
+    canonical: CanonicalAssets,
+    field: DeformationField,
+    optimizer: torch.optim.Optimizer,
+    study: StudyManifest,
+    sample: Mapping[str, Any],
+    smoothness_indices: torch.Tensor,
+    config: MedGS4DConfig,
+    pairwise_cycle: PairwiseTransport | None = None,
+    *,
+    iteration: int,
+) -> dict[str, float]:
+    """Run one render, backward pass, and optimizer update."""
+
+    phase = float(sample["PhasePercent"])
+    slice_index = int(sample["SliceIndex"])
+    respiratory_time = float(sample["AugmentedRespiratoryTime"])
+    neighbor_time = float(sample["NeighborPhasePercent"]) / 100.0
+    target = load_target_tensor(
+        study,
+        phase,
+        slice_index,
+        representation=config.target_representation,
+        device=str(field.xyz.device),
+    )
+    camera = get_camera_for_slice(canonical, slice_index)
+
+    optimizer.zero_grad(set_to_none=True)
+    gaussian_view, state = field.build_phase_state(
+        respiratory_time, use_checkpointing=True
+    )
+    render_result = canonical.runtime.render(
+        camera,
+        gaussian_view,
+        canonical.pipeline,
+        canonical.background,
+        train=True,
+        iter=iteration,
+    )
+    rendered = render_result["render"]
+    image_loss, metrics = compute_reconstruction_loss(
+        canonical,
+        rendered,
+        target,
+        l1_weight=config.training.l1_weight,
+        ssim_weight=config.training.ssim_weight,
+    )
+    magnitude = compute_magnitude_loss(field, state)
+    current_subset = field.build_subset_state(respiratory_time, smoothness_indices)
+    neighbor_subset = field.build_subset_state(neighbor_time, smoothness_indices)
+    smoothness = compute_temporal_smoothness_loss(
+        field, current_subset, neighbor_subset
+    )
+
+    virtual_supervision = (
+        config.training.pseudo_weight > 0
+        or config.training.cycle_weight > 0
+    )
+
+    if virtual_supervision:
+        pseudo_alpha = (
+            ((iteration - 1) % 4 + 1)
+            / 5.0
+        )
+
+        canonical_time = (
+            field.canonical_phase
+            / 100.0
+        )
+
+        pseudo_time = (
+            canonical_time
+            + pseudo_alpha
+            * (
+                respiratory_time
+                - canonical_time
+            )
+        )
+    else:
+        pseudo_alpha = float("nan")
+        pseudo_time = float("nan")
+
+    if config.training.pseudo_weight > 0:
+        (
+            pseudo_supervision,
+            _,
+        ) = compute_pseudo_supervision_loss(
+            field,
+            current_subset,
+            smoothness_indices,
+            endpoint_time=respiratory_time,
+            alpha=pseudo_alpha,
+        )
+    else:
+        pseudo_supervision = torch.zeros(
+            (),
+            device=field.xyz.device,
+            dtype=field.xyz.dtype,
+        )
+
+    if config.training.cycle_weight > 0:
+        (
+            _,
+            pseudo_full_state,
+        ) = field.build_phase_state(
+            pseudo_time,
+            use_checkpointing=True,
+        )
+
+        (
+            cyclic_reconstruction,
+            cycle_canonical_loss,
+            cycle_endpoint_loss,
+        ) = compute_cyclic_reconstruction_loss(
+            canonical,
+            field,
+            study,
+            camera,
+            target,
+            pseudo_full_state,
+            source_time=pseudo_time,
+            endpoint_phase=phase,
+            slice_index=slice_index,
+            config=config,
+            iteration=iteration,
+        )
+    else:
+        cyclic_reconstruction = torch.zeros(
+            (),
+            device=field.xyz.device,
+            dtype=field.xyz.dtype,
+        )
+
+        cycle_canonical_loss = (
+            cyclic_reconstruction
+        )
+
+        cycle_endpoint_loss = (
+            cyclic_reconstruction
+        )
+
+    pairwise_scale = (
+        pairwise_cycle_schedule(
+            config,
+            iteration,
+        )
+        if pairwise_cycle is not None
+        else 0.0
+    )
+
+    if (
+        pairwise_cycle is not None
+        and pairwise_scale > 0
+    ):
+        pairwise_values = (
+            compute_pairwise_cycle_losses(
+                canonical,
+                field,
+                pairwise_cycle,
+                study,
+                camera,
+                target,
+                state,
+                endpoint_phase=phase,
+                endpoint_time=respiratory_time,
+                slice_index=slice_index,
+                config=config,
+                iteration=iteration,
+            )
+        )
+
+        pairwise_cycle_image = (
+            pairwise_values[
+                "cycle_image_loss"
+            ]
+        )
+
+        pairwise_agreement = (
+            pairwise_values[
+                "agreement_loss"
+            ]
+        )
+
+        pairwise_transport = (
+            pairwise_values[
+                "transport_loss"
+            ]
+        )
+
+        pairwise_weighted = (
+            pairwise_scale
+            * (
+                config.training
+                .pairwise_cycle_weight
+                * pairwise_cycle_image
+
+                + config.training
+                .pairwise_agreement_weight
+                * pairwise_agreement
+
+                + config.training
+                .pairwise_transport_weight
+                * pairwise_transport
+            )
+        )
+
+        pairwise_u1 = float(
+            pairwise_values["u1"]
+        )
+
+        pairwise_u2 = float(
+            pairwise_values["u2"]
+        )
+
+        pairwise_u3 = float(
+            pairwise_values["u3"]
+        )
+
+        pairwise_middle_phase = (
+            100.0
+            * float(
+                pairwise_values[
+                    "middle_time"
+                ]
+            )
+        )
+
+    else:
+        zero = torch.zeros(
+            (),
+            device=field.xyz.device,
+            dtype=field.xyz.dtype,
+        )
+
+        pairwise_cycle_image = zero
+        pairwise_agreement = zero
+        pairwise_transport = zero
+        pairwise_weighted = zero
+
+        pairwise_u1 = float("nan")
+        pairwise_u2 = float("nan")
+        pairwise_u3 = float("nan")
+        pairwise_middle_phase = float(
+            "nan"
+        )
+
+    total = (
+        image_loss
+        + config.training.magnitude_weight * magnitude
+        + config.training.smoothness_weight * smoothness
+        + config.training.pseudo_weight * pseudo_supervision
+        + config.training.cycle_weight * cyclic_reconstruction
+        + pairwise_weighted
+    )
+    total.backward()
+
+    gradient_parameters = list(
+        field.model.parameters()
+    )
+
+    if pairwise_cycle is not None:
+        gradient_parameters.extend(
+            pairwise_cycle.parameters()
+        )
+
+    gradient_norm = float(
+        torch.nn.utils.clip_grad_norm_(
+            gradient_parameters,
+            config.training.max_gradient_norm,
+        ).item()
+    )
+
+    optimizer.step()
+    return {
+        "TotalLoss": float(total.detach().item()),
+        "ImageLoss": float(image_loss.detach().item()),
+        "L1": float(metrics["l1"].detach().item()),
+        "SSIM": float(metrics["ssim"].detach().item()),
+        "PSNR": float(metrics["psnr"].detach().item()),
+        "DeformationMagnitudeLoss": float(magnitude.detach().item()),
+        "TemporalSmoothnessLoss": float(smoothness.detach().item()),
+        "PseudoSupervisionLoss": float(
+            pseudo_supervision.detach().item()
+        ),
+        "PseudoAlpha": pseudo_alpha,
+        "PseudoPhasePercent": 100.0 * pseudo_time,
+        "CyclicReconstructionLoss": float(cyclic_reconstruction.detach().item()),
+        "CycleCanonicalImageLoss": float(cycle_canonical_loss.detach().item()),
+        "CycleEndpointImageLoss": float(cycle_endpoint_loss.detach().item()),
+        "PairwiseCycleImageLoss": float(pairwise_cycle_image.detach().item()),
+        "PairwiseAgreementLoss": float(pairwise_agreement.detach().item()),
+        "PairwiseTransportLoss": float(pairwise_transport.detach().item()),
+        "PairwiseCycleWeightedLoss": float(pairwise_weighted.detach().item()),
+        "PairwiseCycleScale": pairwise_scale,
+        "PairwiseU1": pairwise_u1,
+        "PairwiseU2": pairwise_u2,
+        "PairwiseU3": pairwise_u3,
+        "PairwiseMiddlePhasePercent": pairwise_middle_phase,
+        "GradientNorm": gradient_norm,
+    }
+
+
+def save_checkpoint(
+    path: Path,
+    *,
+    iteration: int,
+    field: DeformationField,
+    optimizer: torch.optim.Optimizer,
+    config: MedGS4DConfig,
+    pairwise_cycle: PairwiseTransport | None = None,
+) -> None:
+    """Save a restartable deformation checkpoint."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "iteration": int(iteration),
+        "deformation_mlp_state_dict": field.model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "config": {
+            "method": config.method,
+            "method_options": config.method_options,
+            "study_name": config.study_name,
+            "run_name": config.run_name,
+            "canonical_phase": config.canonical_phase,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": config.canonical_checkpoint_iteration,
+            "parameter_count": field.parameter_count,
+        },
+        "torch_rng_state": torch.get_rng_state(),
+        "cuda_rng_state_all": (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        ),
+    }
+    if pairwise_cycle is not None:
+        payload["pairwise_cycle_state_dict"] = (
+            pairwise_cycle.state_dict()
+        )
+
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def load_checkpoint(
+    path: Path,
+    field: DeformationField,
+    optimizer: torch.optim.Optimizer | None = None,
+    *,
+    device: str,
+    config: MedGS4DConfig | None = None,
+    pairwise_cycle: PairwiseTransport | None = None,
+) -> int:
+    """Restore a deformation checkpoint and optionally validate its run identity."""
+
+    payload = torch.load(path, map_location=device, weights_only=False)
+    checkpoint_config = payload.get("config", {})
+
+    if config is not None:
+        expected = {
+            "method": config.method,
+            "method_options": config.method_options,
+            "study_name": config.study_name,
+            "run_name": config.run_name,
+            "canonical_phase": config.canonical_phase,
+            "parameter_count": field.parameter_count,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": config.canonical_checkpoint_iteration,
+        }
+        mismatches = []
+        for key, expected_value in expected.items():
+            if key not in checkpoint_config:
+                continue
+            actual_value = checkpoint_config[key]
+            if isinstance(expected_value, float):
+                matches = abs(float(actual_value) - expected_value) <= 1e-6
+            else:
+                matches = actual_value == expected_value
+            if not matches:
+                mismatches.append(
+                    f"{key}: {actual_value!r} != {expected_value!r}"
+                )
+        if mismatches:
+            raise ValueError(
+                "Resume checkpoint is incompatible with this run: "
+                + "; ".join(mismatches)
+            )
+
+    field.model.load_state_dict(
+        payload["deformation_mlp_state_dict"],
+        strict=True,
+    )
+
+    if pairwise_cycle is not None:
+        pairwise_state = payload.get(
+            "pairwise_cycle_state_dict"
+        )
+        if pairwise_state is None:
+            raise ValueError(
+                "Checkpoint does not contain pairwise cycle state"
+            )
+        pairwise_cycle.load_state_dict(
+            pairwise_state,
+            strict=True,
+        )
+    if optimizer is not None and "optimizer_state_dict" in payload:
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+    if optimizer is not None and "torch_rng_state" in payload:
+        torch.set_rng_state(payload["torch_rng_state"].cpu())
+    if (
+        optimizer is not None
+        and torch.cuda.is_available()
+        and payload.get("cuda_rng_state_all")
+    ):
+        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+    return int(payload["iteration"])
+
+
+def load_training_history(path: Path) -> pd.DataFrame:
+    """Load training history and tolerate an empty pre-training CSV."""
+
+    if not path.is_file():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame()
+
+
+def reconcile_training_history(
+    history: pd.DataFrame,
+    checkpoint_iteration: int,
+) -> pd.DataFrame:
+    """Trim and deduplicate history so it matches a resumed checkpoint."""
+
+    if history.empty:
+        return history
+    return (
+        history.loc[history["Iteration"].astype(int) <= checkpoint_iteration]
+        .sort_values("Iteration")
+        .drop_duplicates("Iteration", keep="last")
+        .reset_index(drop=True)
+    )
+
+
+def _validation_rows(
+    split_manifest: pd.DataFrame,
+    sample_count: int,
+    seed: int,
+) -> pd.DataFrame:
+    validation = get_split_rows(split_manifest, "validation")
+    if validation.empty or sample_count == 0:
+        return validation.iloc[:0]
+    if sample_count >= len(validation):
+        return validation
+    rng = np.random.default_rng(seed + 2001)
+    selected = []
+    for _, group in validation.groupby("PhasePercent", sort=True):
+        count = max(1, round(sample_count * len(group) / len(validation)))
+        indices = rng.choice(len(group), size=min(count, len(group)), replace=False)
+        selected.append(group.iloc[np.sort(indices)])
+    result = pd.concat(selected, ignore_index=True)
+    return result.head(sample_count)
+
+
+def validate_during_training(
+    canonical: CanonicalAssets,
+    field: DeformationField,
+    study: StudyManifest,
+    rows: pd.DataFrame,
+    config: MedGS4DConfig,
+) -> dict[str, float] | None:
+    """Evaluate a fixed compact validation subset without updating parameters."""
+
+    if rows.empty:
+        return None
+    values = []
+    field.model.eval()
+    with torch.no_grad():
+        for row in rows.itertuples():
+            phase = float(row.PhasePercent)
+            slice_index = int(row.SliceIndex)
+            target = load_target_tensor(
+                study,
+                phase,
+                slice_index,
+                representation=config.target_representation,
+                device=str(field.xyz.device),
+            )
+            view, _ = field.build_phase_state(
+                phase / 100.0, use_checkpointing=False
+            )
+            rendered = canonical.runtime.render(
+                get_camera_for_slice(canonical, slice_index),
+                view,
+                canonical.pipeline,
+                canonical.background,
+            )["render"]
+            _, metrics = compute_reconstruction_loss(
+                canonical,
+                rendered,
+                target,
+                l1_weight=config.training.l1_weight,
+                ssim_weight=config.training.ssim_weight,
+            )
+            values.append(
+                [
+                    float(metrics["l1"].item()),
+                    float(metrics["ssim"].item()),
+                    float(metrics["psnr"].item()),
+                ]
+            )
+    field.model.train()
+    array = np.asarray(values)
+    return {
+        "Samples": len(values),
+        "L1": float(array[:, 0].mean()),
+        "SSIM": float(array[:, 1].mean()),
+        "PSNR": float(array[:, 2].mean()),
+    }
+
+
+def _training_summary(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame()
+    rows = []
+    for label, frame in [("all", history), *[
+        (f"phase_{phase:g}", group)
+        for phase, group in history.groupby("PhasePercent", sort=True)
+    ]]:
+        final = frame.tail(min(25, len(frame)))
+        rows.append(
+            {
+                "Label": label,
+                "Iterations": len(frame),
+                "MeanTotalLoss": final["TotalLoss"].mean(),
+                "MeanL1": final["L1"].mean(),
+                "MeanSSIM": final["SSIM"].mean(),
+                "MeanPSNR": final["PSNR"].mean(),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def train_medgs4d(
+    study: StudyManifest,
+    canonical: CanonicalAssets,
+    run_paths: RunPaths,
+    config: MedGS4DConfig,
+    *,
+    resume: bool = False,
+    resume_checkpoint: Path | None = None,
+    final_evaluation: bool = True,
+) -> Path:
+    """Train or resume one complete phase-conditioned MedGS4D run."""
+
+    set_deterministic_seed(config.training.seed)
+    phase_slice_index = pd.read_csv(study.phase_slice_manifest_path)[
+        ["PhasePercent", "SliceIndex", "SliceCoordinate"]
+    ]
+
+    if resume:
+        split_manifest = pd.read_csv(run_paths.split_manifest)
+    else:
+        split_manifest = create_split_manifest(
+            phase_slice_index,
+            mode=config.split.mode,
+            canonical_phase=config.canonical_phase,
+            validation_phases=config.split.validation_phases,
+        )
+        save_split_manifest(split_manifest, run_paths.split_manifest)
+
+    from training.methods import create_field, training_step_for
+    field = create_field(canonical, config)
+    step = training_step_for(config)
+
+    pairwise_enabled = config.method in {"consistent_cycle", "trajectory_cycle"} or any(
+        value > 0
+        for value in (
+            config.training.pairwise_cycle_weight,
+            config.training.pairwise_agreement_weight,
+            config.training.pairwise_transport_weight,
+        )
+    )
+
+    pairwise_cycle = (
+        PairwiseTransport(
+            field,
+            hidden_dim=(
+                config.training
+                .pairwise_hidden_dim
+            ),
+            hidden_layers=(
+                config.training
+                .pairwise_hidden_layers
+            ),
+            time_frequencies=(
+                config.training
+                .pairwise_time_frequencies
+            ),
+        )
+        if pairwise_enabled
+        else None
+    )
+
+    optimizer = create_optimizer(
+        field,
+        config.training.learning_rate,
+        pairwise_cycle=pairwise_cycle,
+    )
+    run_paths.checkpoints.mkdir(parents=True, exist_ok=True)
+    run_paths.evaluation.mkdir(parents=True, exist_ok=True)
+    run_paths.visualizations.mkdir(parents=True, exist_ok=True)
+    write_json(
+        run_paths.root / "deformation_normalization.json",
+        field.normalization_dict(),
+    )
+
+    if resume:
+        checkpoint_path = (
+            resume_checkpoint.resolve()
+            if resume_checkpoint is not None
+            else find_latest_checkpoint(run_paths.checkpoints)
+        )
+        if checkpoint_path is None or not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"No checkpoint is available for resume: {checkpoint_path}"
+            )
+        start_iteration = load_checkpoint(
+            checkpoint_path,
+            field,
+            optimizer,
+            device=str(field.xyz.device),
+            config=config,
+            pairwise_cycle=pairwise_cycle,
+        )
+        if config.training.iterations < start_iteration:
+            raise ValueError(
+                f"Requested target iteration {config.training.iterations} "
+                f"is earlier than resume checkpoint {start_iteration}"
+            )
+
+        history = reconcile_training_history(
+            load_training_history(run_paths.training_history),
+            start_iteration,
+        )
+        validation_history = reconcile_training_history(
+            load_training_history(run_paths.validation_history),
+            start_iteration,
+        )
+
+        evaluation_history_path = run_paths.evaluation / "history.csv"
+        evaluation_history = load_training_history(evaluation_history_path)
+        if not evaluation_history.empty:
+            iteration_column = (
+                "CheckpointIteration"
+                if "CheckpointIteration" in evaluation_history.columns
+                else "Iteration"
+            )
+            evaluation_history = (
+                evaluation_history.loc[
+                    evaluation_history[iteration_column].astype(int)
+                    <= start_iteration
+                ]
+                .sort_values(iteration_column)
+                .drop_duplicates(iteration_column, keep="last")
+                .reset_index(drop=True)
+            )
+            write_dataframe(evaluation_history_path, evaluation_history)
+
+        # Make default future resume follow the explicitly selected branch.
+        save_checkpoint(
+            run_paths.checkpoints / "deformation_latest.pth",
+            iteration=start_iteration,
+            field=field,
+            optimizer=optimizer,
+            config=config,
+            pairwise_cycle=pairwise_cycle,
+        )
+
+        stale_outputs = (
+            run_paths.completion,
+            run_paths.report,
+            run_paths.report_metrics,
+            run_paths.root / "training_history.pdf",
+            run_paths.evaluation / "per_slice.csv",
+            run_paths.evaluation / "per_phase.csv",
+            run_paths.evaluation / "overall.json",
+            run_paths.evaluation / "metrics.pdf",
+            run_paths.evaluation / "history.pdf",
+        )
+        for path in stale_outputs:
+            path.unlink(missing_ok=True)
+
+        print(
+            f"Resuming MedGS4D from iteration {start_iteration}: "
+            f"{checkpoint_path}",
+            flush=True,
+        )
+    else:
+        start_iteration = 0
+        history = pd.DataFrame()
+        validation_history = pd.DataFrame()
+        initial = run_paths.checkpoints / "deformation_iter_000000.pth"
+        save_checkpoint(
+            initial,
+            iteration=0,
+            field=field,
+            optimizer=optimizer,
+            config=config,
+            pairwise_cycle=pairwise_cycle,
+        )
+        save_checkpoint(
+            run_paths.checkpoints / "deformation_latest.pth",
+            iteration=0,
+            field=field,
+            optimizer=optimizer,
+            config=config,
+            pairwise_cycle=pairwise_cycle,
+        )
+
+    save_config(config, run_paths.config)
+
+    train_rows = get_split_rows(split_manifest, "train")
+    plan = load_or_create_sampling_plan(
+        run_paths.sampling_plan,
+        train_rows,
+        iterations=config.training.iterations,
+        seed=config.training.seed,
+        canonical_phase=config.canonical_phase,
+        phase_jitter_initial_std=config.training.phase_jitter_initial_std,
+        resume=resume,
+        checkpoint_iteration=start_iteration,
+    )
+
+    smoothness_np = (
+        np.load(run_paths.smoothness_indices)
+        if resume and run_paths.smoothness_indices.is_file()
+        else build_smoothness_indices(
+            field.xyz.shape[0],
+            sample_size=config.training.smoothness_gaussians,
+            seed=config.training.seed + 1001,
+        )
+    )
+    if not run_paths.smoothness_indices.is_file():
+        np.save(run_paths.smoothness_indices, smoothness_np)
+    smoothness_indices = torch.from_numpy(smoothness_np).to(
+        device=field.xyz.device,
+        dtype=torch.long,
+    )
+    validation_rows = _validation_rows(
+        split_manifest,
+        config.training.validation_samples,
+        config.training.seed,
+    )
+
+    history_rows = history.to_dict("records") if not history.empty else []
+    validation_rows_history = (
+        validation_history.to_dict("records")
+        if not validation_history.empty
+        else []
+    )
+    elapsed_before = (
+        float(history_rows[-1]["ElapsedSeconds"]) if history_rows else 0.0
+    )
+    segment_start = time.perf_counter()
+    field.model.train()
+    if pairwise_cycle is not None:
+        pairwise_cycle.train()
+
+    for iteration in range(
+        start_iteration + 1,
+        config.training.iterations + 1,
+    ):
+        sample = plan.iloc[iteration - 1].to_dict()
+        metrics = step(
+            canonical,
+            field,
+            optimizer,
+            study,
+            sample,
+            smoothness_indices,
+            config,
+            pairwise_cycle=pairwise_cycle,
+            iteration=iteration,
+        )
+        elapsed = elapsed_before + time.perf_counter() - segment_start
+        history_rows.append(
+            {
+                "Iteration": iteration,
+                "PhasePercent": float(sample["PhasePercent"]),
+                "SliceIndex": int(sample["SliceIndex"]),
+                "NeighborPhasePercent": float(
+                    sample["NeighborPhasePercent"]
+                ),
+                "PhaseJitterStd": float(sample["PhaseJitterStd"]),
+                "PhaseJitter": float(sample["PhaseJitter"]),
+                "LearningRate": float(optimizer.param_groups[0]["lr"]),
+                "ElapsedSeconds": elapsed,
+                "PeakGpuMemoryGB": (
+                    torch.cuda.max_memory_allocated() / 1024**3
+                    if torch.cuda.is_available()
+                    else 0.0
+                ),
+                **metrics,
+            }
+        )
+
+        if (
+            config.training.validate_every > 0
+            and iteration % config.training.validate_every == 0
+            and not validation_rows.empty
+        ):
+            result = validate_during_training(
+                canonical,
+                field,
+                study,
+                validation_rows,
+                config,
+            )
+            if result is not None:
+                validation_rows_history.append(
+                    {"Iteration": iteration, **result}
+                )
+
+        if (
+            iteration % config.training.log_every == 0
+            or iteration == config.training.iterations
+        ):
+            current = pd.DataFrame(history_rows)
+            write_dataframe(run_paths.training_history, current)
+            if validation_rows_history:
+                write_dataframe(
+                    run_paths.validation_history,
+                    pd.DataFrame(validation_rows_history),
+                )
+            window = current.tail(config.training.log_every)
+            print(
+                f"Iteration {iteration:06d}/"
+                f"{config.training.iterations:06d} "
+                f"L1={window['L1'].mean():.6f} "
+                f"SSIM={window['SSIM'].mean():.6f} "
+                f"PSNR={window['PSNR'].mean():.3f}",
+                flush=True,
+            )
+
+        if (
+            iteration % config.training.checkpoint_every == 0
+            or iteration == config.training.iterations
+        ):
+            checkpoint = (
+                run_paths.checkpoints
+                / f"deformation_iter_{iteration:06d}.pth"
+            )
+            save_checkpoint(
+                checkpoint,
+                iteration=iteration,
+                field=field,
+                optimizer=optimizer,
+                config=config,
+                pairwise_cycle=pairwise_cycle,
+            )
+            save_checkpoint(
+                run_paths.checkpoints / "deformation_latest.pth",
+                iteration=iteration,
+                field=field,
+                optimizer=optimizer,
+                config=config,
+                pairwise_cycle=pairwise_cycle,
+            )
+
+    history = pd.DataFrame(history_rows)
+    write_dataframe(run_paths.training_history, history)
+    if validation_rows_history:
+        write_dataframe(
+            run_paths.validation_history,
+            pd.DataFrame(validation_rows_history),
+        )
+    summary = _training_summary(history)
+    write_dataframe(run_paths.training_summary, summary)
+
+    elapsed_seconds = (
+        float(history.iloc[-1]["ElapsedSeconds"])
+        if not history.empty
+        else 0.0
+    )
+    write_json(
+        run_paths.completion,
+        {
+            "status": "complete",
+            "iteration": config.training.iterations,
+            "parameter_count": field.parameter_count,
+            "training_samples": len(train_rows),
+            "validation_samples": int(
+                (split_manifest["Split"] == "validation").sum()
+            ),
+            "elapsed_seconds": elapsed_seconds,
+            "canonical_checkpoint": config.canonical_checkpoint,
+            "canonical_checkpoint_iteration": (
+                config.canonical_checkpoint_iteration
+            ),
+        },
+    )
+
+    from utils.temporal_reporting import generate_training_history_pdf
+
+    generate_training_history_pdf(run_paths.root)
+
+    if final_evaluation:
+        from evaluate_temporal import (
+            aggregate_metrics_overall,
+            aggregate_metrics_per_phase,
+            evaluate_medgs4d_model,
+            save_evaluation_results,
+        )
+        from utils.temporal_reporting import generate_run_report
+
+        per_slice = evaluate_medgs4d_model(
+            study,
+            canonical,
+            field,
+            split_manifest,
+            split="all",
+            target_representation=config.target_representation,
+        )
+        per_phase = aggregate_metrics_per_phase(per_slice)
+        overall = aggregate_metrics_overall(per_slice)
+        overall["Checkpoint"] = str(
+            run_paths.checkpoints / "deformation_latest.pth"
+        )
+        overall["CheckpointIteration"] = config.training.iterations
+        overall["CanonicalCheckpoint"] = config.canonical_checkpoint
+        overall["CanonicalCheckpointIteration"] = (
+            config.canonical_checkpoint_iteration
+        )
+        save_evaluation_results(
+            run_paths.evaluation,
+            per_slice=per_slice,
+            per_phase=per_phase,
+            overall=overall,
+        )
+        generate_run_report(run_paths.root)
+    return run_paths.root

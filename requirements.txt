@@ -8,3 +8,11 @@ plyfile
 nibabel
 open3d
 scikit-image
+# Unified 4D benchmark and notebook
+numpy>=1.26
+pandas>=2.0
+scipy>=1.11
+pydicom>=2.4
+Pillow>=10
+ipykernel
+Jinja2

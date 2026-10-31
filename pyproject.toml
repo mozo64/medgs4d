@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medgs4d"
+version = "0.3.0"
+description = "Unified MedGS and endpoint-only respiratory CT benchmark"
+requires-python = ">=3.10"
+dynamic = ["dependencies"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "nbformat>=5"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools]
+py-modules = ["evaluate_temporal"]
+
+[tool.setuptools.packages.find]
+include = ["arguments*", "gaussian_renderer*", "models*", "scene*", "utils*", "training*", "benchmark*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

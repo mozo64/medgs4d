@@ -12,19 +12,20 @@
 #
 
 from arguments import OptimizationParams
-from scene.gaussian_model import GaussianModel
-from models.flat_splatting.scene.points_gaussian_model import PointsGaussianModel
+
+optimizationParamTypeCallbacks = {"gs": OptimizationParams}
 
 
-optimizationParamTypeCallbacks = {
-    "gs": OptimizationParams,
-}
-
-gaussianModel = {
-    "gs": GaussianModel,
-}
-
-gaussianModelRender = {
-    "gs": GaussianModel,
-    "pgs": PointsGaussianModel
-}
+def __getattr__(name):
+    """Load CUDA-backed registries only when a renderer/trainer requests them."""
+    if name == "gaussianModel":
+        from scene.gaussian_model import GaussianModel
+        registry = {"gs": GaussianModel}
+    elif name == "gaussianModelRender":
+        from scene.gaussian_model import GaussianModel
+        from models.flat_splatting.scene.points_gaussian_model import PointsGaussianModel
+        registry = {"gs": GaussianModel, "pgs": PointsGaussianModel}
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = registry
+    return registry

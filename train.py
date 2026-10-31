@@ -55,7 +55,7 @@ def interpolate(A, B, alpha):
     return I
 
 def training(gs_type, dataset: ModelParams, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint,
-             debug_from, save_xyz, use_dff):
+             debug_from, save_xyz, use_dff, history_callback=None):
     time_start = time.process_time()
     init_time = time.time()
     first_iter = 0
@@ -212,6 +212,32 @@ def training(gs_type, dataset: ModelParams, opt, pipe, testing_iterations, savin
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_psnr_for_log = 0.4 * psnr_ + 0.6 * ema_psnr_for_log
             total_point = gaussians._xyz.shape[0]
+            if (
+                history_callback is not None
+                and (
+                    iteration % history_callback.log_every == 0
+                    or iteration == opt.iterations
+                )
+            ):
+                history_callback(
+                    {
+                        "Iteration": int(iteration),
+                        "TotalLoss": float(loss),
+                        "L1": float(Ll1),
+                        "InterpolationL1": float(Ll1_inter),
+                        "SSIM": 1.0 - float(ssim_loss),
+                        "SSIMLoss": float(ssim_loss),
+                        "SigmaLoss": float(sigma_loss),
+                        "PSNR": float(psnr_),
+                        "EMALoss": float(ema_loss_for_log),
+                        "EMAPSNR": float(ema_psnr_for_log),
+                        "GaussianCount": int(total_point),
+                        "IterationTimeMs": float(
+                            iter_start.elapsed_time(iter_end)
+                        ),
+                        "ElapsedSeconds": float(time.time() - init_time),
+                    }
+                )
             if iteration % 100 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}",
                                           "psnr": f"{psnr_:.{2}f}",
@@ -977,6 +1003,9 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000, 10_000, 15_000, 20_000, 25_000, 30_000, 40_000, 100_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--history_path", type=str, default=None)
+    parser.add_argument("--history_log_every", type=int, default=100)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--save_xyz", action='store_true')
@@ -1011,7 +1040,7 @@ if __name__ == "__main__":
     print("torch cuda: ", torch.cuda.is_available())
     print("Optimizing " + args.model_path)
     # Initialize system state (RNG)
-    safe_state(args.quiet)
+    safe_state(args.quiet, seed=args.seed)
 
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
@@ -1051,12 +1080,16 @@ if __name__ == "__main__":
             seg_head_only=args.seg_head_only,
         )
     else:
+        from utils.training_history import CSVTrainingHistory
+        history_callback = (CSVTrainingHistory(args.history_path, args.history_log_every)
+                            if args.history_path else None)
         print("Training with photometric loss")
         training(
             args.gs_type,
             lp.extract(args), op.extract(args), pp.extract(args),
             args.test_iterations, args.save_iterations, args.checkpoint_iterations,
-            args.start_checkpoint, args.debug_from, args.save_xyz, args.use_dff
+            args.start_checkpoint, args.debug_from, args.save_xyz, args.use_dff,
+            history_callback=history_callback,
         )
 
 

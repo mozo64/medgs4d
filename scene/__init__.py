@@ -9,15 +9,18 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import random
 import json
 from utils.system_utils import searchForMaxIteration
-from models.scenes import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from scene.gaussian_model import GaussianModel
 
 class Scene:
 
@@ -27,6 +30,9 @@ class Scene:
         """b
         :param path: Path to colmap scene main folder.
         """
+        from models.scenes import sceneLoadTypeCallbacks
+        from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians

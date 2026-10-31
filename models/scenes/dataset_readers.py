@@ -148,7 +148,7 @@ def CreateCamerasTransforms(path: str, white_background, distances, extension=".
 
             norm_data = im_data / 255.0
             arr = norm_data[:, :, :3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+            image = Image.fromarray(np.array(arr * 255.0, dtype=np.uint8), "RGB")
             fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
             FovY = fovy
             FovX = fovx
