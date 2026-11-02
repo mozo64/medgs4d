@@ -1191,7 +1191,7 @@ def load_checkpoint(
         and torch.cuda.is_available()
         and payload.get("cuda_rng_state_all")
     ):
-        torch.cuda.set_rng_state_all(payload["cuda_rng_state_all"])
+        torch.cuda.set_rng_state_all([state.cpu() for state in payload["cuda_rng_state_all"]])
     return int(payload["iteration"])
 
 
